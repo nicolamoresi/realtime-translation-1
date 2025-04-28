@@ -1,9 +1,11 @@
 # app/main.py
 import os
+import sys
 import time
 import asyncio
 import logging
-import sys
+
+import json
 from logging.handlers import RotatingFileHandler
 import psutil
 
@@ -47,6 +49,27 @@ def setup_logging():
 # Initialize logging
 logger = setup_logging()
 
+async def buffer_cleanup_task():
+    """Background task to periodically clean up old audio buffers and ping connections"""
+    while True:
+        try:
+            await chat_mediator.cleanup_old_buffers()
+            
+            # Ping all video connections to keep them alive
+            for room_id, users in chat_mediator.video_sessions.items():
+                for user_id, ws in users.items():
+                    try:
+                        if ws.client_state.name == "CONNECTED":
+                            await ws.send_json({"type": "ping", "timestamp": time.time()})
+                    except Exception as e:
+                        logger.error(f"Error pinging video connection for {user_id}: {e}")
+                        
+        except Exception as e:
+            logger.error(f"Error in buffer cleanup task: {e}")
+        
+        # Run every 5 seconds
+        await asyncio.sleep(5)
+
 app = FastAPI()
 
 # Add CORS middleware
@@ -57,6 +80,14 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Add this to the app startup event handler
+@app.on_event("startup")
+async def startup_event():
+    """Start background tasks on application startup"""
+    # Start the buffer cleanup task
+    asyncio.create_task(buffer_cleanup_task())
+    logger.info("Started audio buffer cleanup background task")
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
@@ -126,11 +157,6 @@ async def signup(user_data: UserCreate):
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Email already registered"
         )
-    
-    # In a real app, hash the password!
-    # from passlib.context import CryptContext
-    # pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-    # hashed_password = pwd_context.hash(user_data.password)
     
     # For demo purposes, we'll store the password directly (don't do this in production!)
     new_user = User(
@@ -225,14 +251,23 @@ async def get_demo_token():
 
 @app.websocket("/ws/voice/{room_id}")
 async def ws_voice(ws: WebSocket, room_id: str):
-    # Connection acceptance and setup
+    """
+    WebSocket endpoint for voice processing with optional audio-only mode
+    that skips transcription and text translation operations
+    """
+    # Track connection variables for cleanup
+    user_id = None
+    monitor_task = None
+    processor = None
+    
     try:
+        # --- Connection setup and authentication ---
         token = ws.query_params.get("token")
         if not token:
             await ws.close(code=status.WS_1008_POLICY_VIOLATION, reason="Missing authentication")
             return
             
-        # Validate token and get user_id
+        # Validate token
         try:
             user_id = validate_token(token)
         except Exception as e:
@@ -240,183 +275,154 @@ async def ws_voice(ws: WebSocket, room_id: str):
             await ws.close(code=status.WS_1008_POLICY_VIOLATION, reason="Invalid authentication")
             return
             
+        # Extract parameters from query params
+        target_language = ws.query_params.get("target_lang", "en")
+        audio_only_param = ws.query_params.get("audio_only", None)
+        audio_only = audio_only_param.lower() in ["false", "1"] if audio_only_param else True
+
+        # Accept the connection
         await ws.accept()
-        logger.info(f"Voice WebSocket connection established for user {user_id} in room {room_id}")
+        logger.info(f"Voice WebSocket connected: user={user_id}, room={room_id}, language={target_language}, audio_only={audio_only}")
         
-        # Set up queues with backpressure
-        q_tx: asyncio.Queue[bytes] = asyncio.Queue(maxsize=50)  # Limit queue size
-        q_audio: asyncio.Queue[bytes] = asyncio.Queue(maxsize=50)
+        # Create dedicated speech processor for this connection
+        processor = SpeechProcessor(target_language=target_language, audio_only=audio_only)
         
-        # Create event for tracking last data receipt
+        # Create activity tracking event
         last_data_time = asyncio.Event()
         
-        # Start monitor task
+        # Start connection monitor
         monitor_task = asyncio.create_task(
             connection_monitor(ws, user_id, room_id, last_data_time)
         )
         
-        # Add to session
+        # Add to mediator
         await chat_mediator.add_voice_connection(room_id, user_id, ws)
         
-        # Define transcription task with proper error handling
-        async def run_transcribe():
+        # --- Main receive loop ---
+        while True:
             try:
-                logger.info(f"Starting transcription task for {user_id}")
-                async for transcript in speech_processor.transcribe_audio_stream(q_tx):
-                    # Process transcript
-                    if transcript and transcript.strip():
-                        # Send to chat mediator
-                        await chat_mediator.add_transcript(room_id, user_id, transcript)
-                        
-                        # Send to translation if needed
-                        if q_audio.qsize() < q_audio.maxsize:
-                            await q_audio.put(transcript.encode('utf-8'))
-                        else:
-                            logger.warning(f"Translation queue full for {user_id}, dropping transcript")
-            except asyncio.CancelledError:
-                logger.info(f"Transcription task cancelled for {user_id}")
-                raise
-            except Exception as e:
-                logger.error(f"Error in transcription task for {user_id}: {e}", exc_info=True)
-                # Signal that a critical task has failed
-                monitor_task.cancel()
-                raise
+                # Verify connection state
+                if ws.client_state.name != "CONNECTED":
+                    logger.warning(f"WebSocket for {user_id} is in state {ws.client_state.name}, closing")
+                    break
+                    
+                # Receive message with timeout
+                message = await asyncio.wait_for(ws.receive(), timeout=30.0)
+                last_data_time.set()  # Signal activity
                 
-        # Define translation task
-        async def run_audio_translate():
-            try:
-                logger.info(f"Starting translation task for {user_id}")
-                while True:
-                    # Get transcript
-                    transcript = await q_audio.get()
-                    transcript_text = transcript.decode('utf-8')
+                # Process binary audio data
+                if "bytes" in message:
+                    audio_data = message["bytes"]
+                    logger.debug(f"Received {len(audio_data)} bytes of audio from {user_id}")
                     
-                    # Process translation
-                    try:
-                        translation = await openai_client.translate_text(
-                            transcript_text, 
-                            source_language="en",  # Determine dynamically in real app
-                            target_language="es"   # Determine dynamically in real app
+                    # Process through the router
+                    asyncio.create_task(
+                        chat_mediator.process_audio_stream(
+                            room_id, 
+                            user_id, 
+                            audio_data,
+                            processor
                         )
+                    )
+                
+                # Process text control messages
+                elif "text" in message:
+                    try:
+                        json_data = json.loads(message["text"])
+                        message_type = json_data.get("type", "unknown")
                         
-                        # Send translated text back to client
-                        if translation:
-                            await chat_mediator.add_translation(
-                                room_id, user_id, transcript_text, translation
-                            )
-                    except Exception as e:
-                        logger.error(f"Translation error for {user_id}: {e}")
-                        
-                    # Mark task as done
-                    q_audio.task_done()
-            except asyncio.CancelledError:
-                logger.info(f"Translation task cancelled for {user_id}")
-                raise
-            except Exception as e:
-                logger.error(f"Error in translation task for {user_id}: {e}", exc_info=True)
-                monitor_task.cancel()
-                raise
-        
-        # Create tasks with error handling
-        tasks = [
-            asyncio.create_task(run_transcribe()),
-            asyncio.create_task(run_audio_translate()),
-            monitor_task
-        ]
-        
-        try:
-            # Main receive loop with error handling
-            while True:
-                try:
-                    # First, check if the connection is still open before trying to receive
-                    if ws.client_state.name != "CONNECTED":
-                        logger.warning(f"WebSocket state for {user_id} is {ws.client_state.name}, exiting receive loop")
-                        break
-                        
-                    # Use a timeout for receiving to prevent blocking indefinitely
-                    message = await asyncio.wait_for(ws.receive(), timeout=10.0)
-                    
-                    # Handle different message types
-                    if "bytes" in message:
-                        data = message["bytes"]
-                        last_data_time.set()  # Signal activity
-                        logger.debug(f"Received {len(data)} bytes from {user_id}")
-                        
-                        # Process or queue data
-                        try:
-                            # Use non-blocking put with timeout to implement backpressure
-                            await asyncio.wait_for(q_tx.put(data), timeout=1.0)
-                        except asyncio.TimeoutError:
-                            logger.warning(f"Queue full for {user_id}, dropping data")
+                        if message_type == "pong":
+                            logger.debug(f"Received pong from {user_id}")
                             
-                    # Handle text messages (including pongs)
-                    elif "text" in message:
-                        text_data = message["text"]
-                        last_data_time.set()  # Signal activity
-                        
-                        # Process text message...
-                        
-                except WebSocketDisconnect:
-                    logger.info(f"WebSocket disconnected for {user_id} in room {room_id}")
-                    break
-                except asyncio.TimeoutError:
-                    # Timeout on receive is not an error, just check connection state and continue
-                    logger.debug(f"Receive timeout for {user_id}, checking connection state")
-                    if ws.client_state.name != "CONNECTED":
-                        logger.info(f"Connection no longer active for {user_id}, exiting receive loop")
-                        break
-                    continue
-                except Exception as e:
-                    logger.error(f"Error receiving data from {user_id}: {e}")
-                    break
+                        elif message_type == "config":
+                            # Handle language and mode change
+                            new_language = json_data.get("target_language")
+                            audio_only_param = json_data.get("audio_only")
+                            
+                            should_update = False
+                            
+                            if new_language and new_language != target_language:
+                                target_language = new_language
+                                should_update = True
+                            
+                            if audio_only_param is not None:
+                                audio_only = audio_only_param
+                                should_update = True
+                            
+                            if should_update:
+                                # Create new processor with updated settings
+                                processor = SpeechProcessor(
+                                    target_language=target_language, 
+                                    audio_only=audio_only
+                                )
+                                
+                                logger.info(f"Updated settings for {user_id}: lang={target_language}, audio_only={audio_only}")
+                                await ws.send_json({
+                                    "type": "config_update",
+                                    "status": "success",
+                                    "target_language": target_language,
+                                    "audio_only": audio_only
+                                })
+                        else:
+                            logger.debug(f"Received text message: {message['text'][:100]}")
+                            
+                    except json.JSONDecodeError:
+                        logger.debug(f"Received non-JSON text from {user_id}")
                     
-        finally:
-            # Remove from session
+            except WebSocketDisconnect:
+                logger.info(f"WebSocket disconnected for {user_id}")
+                break
+            except asyncio.TimeoutError:
+                # This is not an error, just check if the connection is still active
+                continue
+            except Exception as e:
+                logger.error(f"Error in voice WebSocket for {user_id}: {e}")
+                break
+                
+    except Exception as e:
+        logger.error(f"Unhandled exception in voice websocket: {e}", exc_info=True)
+        
+    finally:
+        # --- Cleanup resources ---
+        if user_id:
             await chat_mediator.remove_connection(room_id, user_id)
             
-            # Ensure all tasks are properly cleaned up
-            for task in tasks:
-                if not task.done():
-                    task.cancel()
-                    
-            # Wait for tasks to complete with timeout
+        if monitor_task and not monitor_task.done():
+            monitor_task.cancel()
             try:
                 await asyncio.wait_for(
-                    asyncio.gather(*tasks, return_exceptions=True),
-                    timeout=5.0
+                    asyncio.gather(monitor_task, return_exceptions=True),
+                    timeout=2.0
                 )
             except asyncio.TimeoutError:
-                logger.warning(f"Timeout waiting for tasks to complete for {user_id}")
+                logger.warning(f"Timeout waiting for monitor task cleanup for {user_id}")
                 
-            logger.info(f"All tasks cleaned up for {user_id}")
-            
-            # Ensure connection is closed
-            try:
-                await ws.close()
-            except:
-                pass
-                
-            # Log memory usage periodically
-            log_memory_usage()
-            
-    except Exception as e:
-        logger.error(f"Unhandled exception in voice websocket handler: {e}", exc_info=True)
         try:
-            await ws.close(code=status.WS_1011_INTERNAL_ERROR)
-        except:
-            pass
+            await ws.close()
+        except Exception as e:
+            logger.debug(f"Error during WebSocket closure: {e}")
+        
+        log_memory_usage()
+
 
 @app.websocket("/ws/video/{room_id}")
 async def ws_video(ws: WebSocket, room_id: str):
-    # Similar structure to voice endpoint but for video
-    # With the same error handling and connection management improvements
+    """
+    WebSocket endpoint for video - routes video data between clients
+    without processing (following the requirements)
+    """
+    # Track connection variables for cleanup
+    user_id = None
+    monitor_task = None
+    
     try:
+        # --- Connection setup and authentication ---
         token = ws.query_params.get("token")
         if not token:
             await ws.close(code=status.WS_1008_POLICY_VIOLATION, reason="Missing authentication")
             return
             
-        # Validate token and get user_id
+        # Validate token
         try:
             user_id = validate_token(token)
         except Exception as e:
@@ -424,174 +430,99 @@ async def ws_video(ws: WebSocket, room_id: str):
             await ws.close(code=status.WS_1008_POLICY_VIOLATION, reason="Invalid authentication")
             return
             
+        # Accept connection
         await ws.accept()
-        logger.info(f"Video WebSocket connection established for user {user_id} in room {room_id}")
+        logger.info(f"Video WebSocket connected: user={user_id}, room={room_id}")
+        
+        # Activity tracking
+        last_data_time = asyncio.Event()
+        
+        # Start connection monitor
+        monitor_task = asyncio.create_task(
+            connection_monitor(ws, user_id, room_id, last_data_time)
+        )
         
         # Add to mediator
         await chat_mediator.add_video_connection(room_id, user_id, ws)
         
-        # Set up data tracking
-        last_data_time = asyncio.Event()
-        
-        # Start monitor task
-        monitor_task = asyncio.create_task(
-            connection_monitor(ws, user_id, room_id, last_data_time)
-        )
-        
-        try:
-            # Main receive loop
-            while True:
-                try:
-                    message = await ws.receive()
-                    last_data_time.set()  # Signal activity
-                    
-                    if "bytes" in message:
-                        data = message["bytes"]
-                        logger.debug(f"Received {len(data)} bytes of video from {user_id}")
-                        
-                        # Broadcast video data to other clients
-                        await chat_mediator.broadcast_video(room_id, user_id, data)
-                        
-                except WebSocketDisconnect:
-                    logger.info(f"Video WebSocket disconnected for user {user_id} in room {room_id}")
-                    break
-                except Exception as e:
-                    logger.error(f"Error in video websocket for {user_id}: {e}")
+        # --- Main receive loop ---
+        while True:
+            try:
+                # Check connection state
+                if ws.client_state.name != "CONNECTED":
+                    logger.warning(f"WebSocket for {user_id} is in state {ws.client_state.name}, closing")
                     break
                     
-        finally:
-            # Clean up
+                # Receive with timeout (Azure best practice)
+                message = await asyncio.wait_for(ws.receive(), timeout=30.0)
+                last_data_time.set()  # Signal activity
+                
+                # Process binary data (video frames)
+                if "bytes" in message:
+                    video_data = message["bytes"]
+                    
+                    # Log receipt of data with tracking info (for observability)
+                    frame_size = len(video_data)
+                    logger.debug(f"Received video frame: {frame_size} bytes from {user_id}")
+                    
+                    # Simply route video to other participants without processing
+                    asyncio.create_task(
+                        chat_mediator.route_video(room_id, user_id, video_data)
+                    )
+                    
+                # Process text messages (pongs, control messages)
+                elif "text" in message:
+                    try:
+                        json_data = json.loads(message["text"])
+                        message_type = json_data.get("type", "unknown")
+                        
+                        if message_type == "pong":
+                            logger.debug(f"Received pong from {user_id}")
+                        else:
+                            logger.debug(f"Received text message type: {message_type}")
+                    except json.JSONDecodeError:
+                        pass
+                        
+            except WebSocketDisconnect:
+                logger.info(f"Video WebSocket disconnected for {user_id}")
+                break
+            except asyncio.TimeoutError:
+                # Not an error, just check connection
+                continue
+            except Exception as e:
+                logger.error(f"Error in video WebSocket for {user_id}: {e}")
+                break
+                
+    except Exception as e:
+        logger.error(f"Unhandled exception in video websocket: {e}", exc_info=True)
+        
+    finally:
+        # --- Cleanup resources following Azure best practices ---
+        
+        # Remove from mediator
+        if user_id:
             await chat_mediator.remove_connection(room_id, user_id)
             
-            if not monitor_task.done():
-                monitor_task.cancel()
-                
+        # Cancel monitor task
+        if monitor_task and not monitor_task.done():
+            monitor_task.cancel()
             try:
                 await asyncio.wait_for(
                     asyncio.gather(monitor_task, return_exceptions=True),
-                    timeout=5.0
+                    timeout=2.0
                 )
             except asyncio.TimeoutError:
-                logger.warning(f"Timeout waiting for monitor task to complete for {user_id}")
+                logger.warning(f"Timeout waiting for monitor task cleanup for {user_id}")
                 
-            try:
-                await ws.close()
-            except:
-                pass
-                
-    except Exception as e:
-        logger.error(f"Unhandled exception in video websocket handler: {e}", exc_info=True)
+        # Close WebSocket gracefully
         try:
-            await ws.close(code=status.WS_1011_INTERNAL_ERROR)
-        except:
+            await ws.close()
+        except Exception:
             pass
+            
+        # Log metrics
+        log_memory_usage()
 
-@app.websocket("/ws/chat/{room_id}")
-async def ws_chat(ws: WebSocket, room_id: str):
-    # Text chat websocket endpoint
-    # With the same error handling and connection management improvements
-    try:
-        token = ws.query_params.get("token")
-        if not token:
-            await ws.close(code=status.WS_1008_POLICY_VIOLATION, reason="Missing authentication")
-            return
-            
-        # Validate token and get user_id
-        try:
-            user_id = validate_token(token)
-        except Exception as e:
-            logger.error(f"Token validation error: {e}")
-            await ws.close(code=status.WS_1008_POLICY_VIOLATION, reason="Invalid authentication")
-            return
-            
-        await ws.accept()
-        logger.info(f"Chat WebSocket connection established for user {user_id} in room {room_id}")
-        
-        # Add to mediator
-        await chat_mediator.add_chat_connection(room_id, user_id, ws)
-        
-        # Set up data tracking
-        last_data_time = asyncio.Event()
-        
-        # Start monitor task
-        monitor_task = asyncio.create_task(
-            connection_monitor(ws, user_id, room_id, last_data_time)
-        )
-        
-        try:
-            # Main receive loop
-            while True:
-                try:
-                    message = await ws.receive_json()
-                    last_data_time.set()  # Signal activity
-                    
-                    # Process chat message
-                    message_type = message.get("type", "unknown")
-                    
-                    if message_type == "chat":
-                        text = message.get("text", "")
-                        if text:
-                            # Add message to chat history
-                            await chat_mediator.add_chat_message(room_id, user_id, text)
-                            
-                            # Translate if needed
-                            if message.get("translate", False):
-                                try:
-                                    translation = await openai_client.translate_text(
-                                        text,
-                                        source_language=message.get("source_lang", "auto"),
-                                        target_language=message.get("target_lang", "en")
-                                    )
-                                    
-                                    # Send translation back
-                                    if translation:
-                                        await chat_mediator.add_translation(
-                                            room_id, user_id, text, translation
-                                        )
-                                except Exception as e:
-                                    logger.error(f"Translation error for chat: {e}")
-                                    await ws.send_json({
-                                        "type": "error",
-                                        "message": "Translation failed"
-                                    })
-                    elif message_type == "pong":
-                        logger.debug(f"Received pong from {user_id}")
-                    else:
-                        logger.warning(f"Unknown message type from {user_id}: {message_type}")
-                        
-                except WebSocketDisconnect:
-                    logger.info(f"Chat WebSocket disconnected for user {user_id} in room {room_id}")
-                    break
-                except Exception as e:
-                    logger.error(f"Error in chat websocket for {user_id}: {e}")
-                    break
-                    
-        finally:
-            # Clean up
-            await chat_mediator.remove_connection(room_id, user_id)
-            
-            if not monitor_task.done():
-                monitor_task.cancel()
-                
-            try:
-                await asyncio.wait_for(
-                    asyncio.gather(monitor_task, return_exceptions=True),
-                    timeout=5.0
-                )
-            except asyncio.TimeoutError:
-                logger.warning(f"Timeout waiting for monitor task to complete for {user_id}")
-                
-            try:
-                await ws.close()
-            except:
-                pass
-                
-    except Exception as e:
-        logger.error(f"Unhandled exception in chat websocket handler: {e}", exc_info=True)
-        try:
-            await ws.close(code=status.WS_1011_INTERNAL_ERROR)
-        except:
-            pass
 
 # Health check endpoint
 @app.get("/health")

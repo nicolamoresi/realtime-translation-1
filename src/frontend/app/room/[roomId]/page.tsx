@@ -1,159 +1,193 @@
 'use client'
 
+/*
+  Audio‑only real‑time translation client (AudioWorklet‑only)
+  -----------------------------------------------------------
+  • Anonymous or signed‑in token
+  • ONE voice WebSocket
+  • Mic capture with AudioWorkletNode (no ScriptProcessor fallback)
+  • 7 s silence auto‑stop
+  • Live playback through <audio>
+  • Small traffic monitor
+*/
+
 import { useEffect, useRef, useState } from 'react'
-import { useParams, useRouter } from 'next/navigation'
-import { createWebSocket, WSMessage } from '@/utils/websocket'
+import { useParams }                      from 'next/navigation'
+import { API_BASE, getAnonymousAccess }   from '@/utils/api'
 
-export default function RoomPage() {
-  const { roomId } = useParams()
-  const router = useRouter()
-  const token = typeof window !== 'undefined' ? localStorage.getItem('token') : null
-  const [transcripts, setTranscripts] = useState<string[]>([])
-  const [micEnabled, setMicEnabled] = useState(false)
+interface Stats { out: number; in: number }
 
-  const audioWs = useRef<WebSocket | null>(null)
-  const videoWs = useRef<WebSocket | null>(null)
-  const localVideoRef = useRef<HTMLVideoElement>(null)
-  const remoteVideoRef = useRef<HTMLVideoElement>(null)
-  const remoteAudioRef = useRef<HTMLAudioElement>(null)
-  const recorderRef = useRef<MediaRecorder| null>(null)
-  const sendFrameInterval = useRef<number | null>(null)
+export default function Simulator() {
+  /* ────────── state ────────── */
+  const { roomId } = useParams<{ roomId: string }>()
+  const [token,  setToken]  = useState<string | null>(null)
+  const [error,  setError]  = useState<string | null>(null)
+  const [status, setStatus] = useState('Connecting …')
+  const [micOn,  setMicOn]  = useState(false)
+  const [talk ,  setTalk ]  = useState(false)
+  const [stats,  setStats]  = useState<Stats>({ out: 0, in: 0 })
 
-  // 1) On mount: set up video, sockets, but do NOT request audio yet
+  /* ────────── refs ─────────── */
+  const wsRef     = useRef<WebSocket | null>(null)
+  const ctxRef    = useRef<AudioContext | null>(null)
+  const nodeRef   = useRef<AudioWorkletNode | null>(null)
+  const streamRef = useRef<MediaStream | null>(null)
+  const micFlag   = useRef(false)
+  const lastAct   = useRef<number>(Date.now())
+  const timerRef  = useRef<number | null>(null)
+  const audioElm  = useRef<HTMLAudioElement | null>(null)
+
+  useEffect(() => { micFlag.current = micOn }, [micOn])
+
+  /* ────────── auth (anon) ───── */
   useEffect(() => {
-    if (!token) {
-      router.push('/signin')
+    const anon = new URLSearchParams(location.search).get('anonymous') === 'true'
+    ;(async () => {
+      try {
+        const tk = anon
+          ? (await getAnonymousAccess(roomId)).access_token
+          : localStorage.getItem('token')
+        if (!tk) throw new Error('no token')
+        if (anon) localStorage.setItem('token', tk)
+        setToken(tk)
+      } catch { setError('Authentication failed') }
+    })()
+  }, [roomId])
+
+  /* ───── open / close WS ───── */
+  useEffect(() => {
+    if (!token) return
+    const ws = new WebSocket(
+      `${API_BASE.replace(/^http/, 'ws')}/ws/voice/${roomId}?token=${token}&audio_only=true`
+    )
+    ws.binaryType = 'arraybuffer'
+    ws.onopen  = () => setStatus('Connected')
+    ws.onclose = () => setStatus('Disconnected')
+    ws.onerror = () => setError('Voice WebSocket error')
+    ws.onmessage = ev => {
+      if (!(ev.data instanceof ArrayBuffer)) return
+      setStats(s => ({ ...s, in: s.in + ev.data.byteLength }))
+      if (audioElm.current) {
+        const url = URL.createObjectURL(new Blob([ev.data], { type: 'audio/wav' }))
+        audioElm.current.src = url
+        audioElm.current.play().catch(() => {})
+      }
+    }
+    wsRef.current = ws
+    return () => ws.close()
+  }, [token, roomId])
+
+  /* ───── mic helpers ───── */
+  async function startMic() {
+    if (micOn || wsRef.current?.readyState !== WebSocket.OPEN) return
+
+    /* Ensure AudioWorklet support */
+    const workletSupported = 'AudioWorklet' in window
+    if (!workletSupported) {
+      setError('AudioWorklet not supported by this browser')
       return
     }
 
-    // setup audio WS (will only be used once micEnabled)
-    audioWs.current = createWebSocket(
-      `/ws/voice/${roomId}`,
-      token,
-      (msg: WSMessage) => {
-        if (msg.transcript) {
-          setTranscripts(t => [...t, msg.transcript!, `(en) ${msg.translated}`])
-        }
-      },
-      (data: ArrayBuffer) => {
-        if (remoteAudioRef.current) {
-          const blob = new Blob([data], { type: 'audio/webm' })
-          const url = URL.createObjectURL(blob)
-          remoteAudioRef.current.src = url
-          remoteAudioRef.current.play().catch(() => {})
-          setTimeout(() => URL.revokeObjectURL(url), 30_000)
-        }
-      }
-    )
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      streamRef.current = stream
 
-    // setup video WS
-    videoWs.current = createWebSocket(
-      `/ws/video/${roomId}`,
-      token,
-      msg => {
-        if (msg.video && remoteVideoRef.current) {
-          remoteVideoRef.current.src = `data:video/webm;base64,${msg.video}`
-        }
-      }
-    )
+      const AudioContextConstructor = window.AudioContext || ((window as unknown) as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+      const ctx = new AudioContextConstructor();
+      ctxRef.current = ctx
+      const src = ctx.createMediaStreamSource(stream)
 
-    // immediately request camera only
-    navigator.mediaDevices.getUserMedia({ video: true })
-      .then(stream => {
-        if (localVideoRef.current) {
-          localVideoRef.current.srcObject = stream
-        }
-        // capture video frames
-        const canvas = document.createElement('canvas')
-        const ctx = canvas.getContext('2d')!
-        canvas.width = 320
-        canvas.height = 240
-        const sendFrame = () => {
-          const ws = videoWs.current
-          if (ws?.readyState !== WebSocket.OPEN) return
-          const video = localVideoRef.current
-          if (!video) return
-          ctx.drawImage(video, 0, 0, 320, 240)
-          canvas.toBlob(blob => {
-            if (!blob) return
-            const reader = new FileReader()
-            reader.onload = () => {
-              const b64 = (reader.result as string).split(',')[1]
-              ws.send(b64)
+      /* inlined worklet */
+      const blob = new Blob(
+        [`
+          class P extends AudioWorkletProcessor {
+            process(i){
+              const c=i[0][0];
+              if(!c) return true;
+              let m=0; for(const v of c) m+=Math.abs(v);
+              const act=m/c.length>0.01;
+              this.port.postMessage({act,buf:c.buffer},[c.buffer]);
+              return true;
             }
-            reader.readAsDataURL(blob)
-          }, 'video/webm')
-        }
-        videoWs.current?.addEventListener('open', () => {
-          sendFrameInterval.current = window.setInterval(sendFrame, 200)
-        })
-      })
-      .catch(err => console.error('Camera access error:', err))
+          } registerProcessor('p',P);
+        `],
+        { type: 'application/javascript' }
+      )
 
-    return () => {
-      // cleanup on unmount
-      if (sendFrameInterval.current) clearInterval(sendFrameInterval.current)
-      recorderRef.current?.stop()
-      audioWs.current?.close()
-      videoWs.current?.close()
+      await ctx.audioWorklet.addModule(URL.createObjectURL(blob))
+
+      const node = new AudioWorkletNode(ctx, 'p', { numberOfOutputs: 0 })
+      node.port.onmessage = ({ data }) => {
+        if (!micFlag.current || !data.act) return
+        lastAct.current = Date.now()
+        wsRef.current!.send(data.buf)
+        setStats(s => ({ ...s, out: s.out + (data.buf as ArrayBuffer).byteLength }))
+      }
+      src.connect(node)
+      nodeRef.current = node
+
+      timerRef.current = window.setInterval(() => {
+        if (Date.now() - lastAct.current > 7000) toggleMic()
+      }, 1000)
+
+      setMicOn(true)
+      setTalk(true)
+    } catch {
+      setError('Microphone permission denied or AudioWorklet init failed')
     }
-  }, [roomId, token, router])
-
-  // 2) When user clicks "Enable Microphone", ask for audio permission & start streaming
-  const enableMic = () => {
-    if (micEnabled) return
-    setMicEnabled(true)
-    navigator.mediaDevices.getUserMedia({ audio: true })
-      .then(stream => {
-        // start recording
-        const recorder = new MediaRecorder(stream)
-        recorder.ondataavailable = async e => {
-          const ws = audioWs.current
-          if (ws?.readyState === WebSocket.OPEN) {
-            const buffer = await e.data.arrayBuffer()
-            ws.send(buffer)
-          }
-        }
-        recorder.start(250)  // smaller chunks (<500ms) for lower latency
-        recorderRef.current = recorder
-      })
-      .catch(err => {
-        console.error('Microphone access error:', err)
-        setMicEnabled(false)
-      })
   }
 
+  function stopMic() {
+    setMicOn(false); setTalk(false)
+    if (timerRef.current !== null) clearInterval(timerRef.current)
+    nodeRef.current?.disconnect()
+    ctxRef.current?.close()
+    streamRef.current?.getTracks().forEach(t => t.stop())
+    nodeRef.current = null
+    ctxRef.current  = null
+    streamRef.current = null
+  }
+
+  const toggleMic = () => (micOn ? stopMic() : startMic())
+
+  /* ───── UI ───── */
+  if (error) return <p className="p-6 text-red-600">{error}</p>
+
   return (
-    <div className="p-4 grid grid-cols-2 gap-4">
-      <div>
-        <h2 className="font-bold mb-2">Local Video</h2>
-        <video ref={localVideoRef} autoPlay muted className="w-full rounded" />
+    <div className="p-6 space-y-6">
+      <h1 className="text-xl font-bold">Room {roomId}</h1>
+      <p>Status: {status}</p>
+
+      {/* traffic */}
+      <div className="grid grid-cols-2 gap-4 text-sm">
+        <div className="p-2 bg-gray-100 rounded">
+          <p className="font-medium">Out</p>
+          {(stats.out / 1024).toFixed(1)} KB
+        </div>
+        <div className="p-2 bg-gray-100 rounded">
+          <p className="font-medium">In</p>
+          {(stats.in / 1024).toFixed(1)} KB
+        </div>
+      </div>
+
+      <audio ref={audioElm} autoPlay controls className="w-full" />
+
+      <div className="flex justify-center">
         <button
-          onClick={enableMic}
-          disabled={micEnabled}
-          className="mt-2 px-4 py-2 bg-blue-600 text-white rounded disabled:opacity-50"
+          onClick={toggleMic}
+          className={`px-6 py-3 rounded-full text-white font-bold ${
+            micOn ? 'bg-red-600 hover:bg-red-700' : 'bg-green-600 hover:bg-green-700'
+          }`}
         >
-          {micEnabled ? 'Microphone Enabled' : 'Enable Microphone'}
+          {micOn ? 'Stop' : 'Start'} Speaking
         </button>
       </div>
-      <div>
-        <h2 className="font-bold mb-2">Remote Video</h2>
-        <video ref={remoteVideoRef} autoPlay className="w-full rounded" />
-      </div>
-      <div className="col-span-2 space-y-4">
-        <div>
-          <h2 className="font-bold mb-2">Remote Audio</h2>
-          <audio ref={remoteAudioRef} controls className="w-full" />
+
+      {talk && (
+        <div className="fixed bottom-4 right-4 bg-green-500 text-white px-4 py-2 rounded-full animate-pulse">
+          Speaking…
         </div>
-        <div>
-          <h2 className="font-bold mb-2">Transcripts</h2>
-          <div className="h-40 overflow-y-auto bg-gray-100 p-2 rounded">
-            {transcripts.map((t, i) => (
-              <p key={i} className="text-sm">{t}</p>
-            ))}
-          </div>
-        </div>
-      </div>
+      )}
     </div>
   )
 }

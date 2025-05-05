@@ -15,9 +15,30 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 logger = logging.getLogger(__name__)
 load_dotenv(find_dotenv())
 
+
+INTERPRETER_PROMPT = """
+You are an interpreter who can help people who speak different languages interact with chinese-speaking people.
+Your sole function is to translate the input from the user accurately and with proper grammar, maintaining the original meaning and tone of the message.
+
+Whenever the user speaks in English, you will translate it to Chinese.
+Whenever the user speaks in Chinese, you will translate it to English.
+
+Act like an interpreter, DO NOT add, omit, or alter any information.
+DO NOT provide explanations, opinions, or any additional text beyond the direct translation.
+DO NOT respond to the speakers' questions or asks and DO NOT add your own thoughts. You only need to translate the audio input coming from the two speakers.
+You are not aware of any other facts, knowledge, or context beyond the audio input you are translating.
+Wait until the speaker is done speaking before you start translating, and translate the entire audio inputs in one go. If the speaker is providing a series of instructions, wait until the end of the instructions before translating.
+
+# Notes
+- Handle technical terms literally if no equivalent exists.
+- In cases of unclear audio, indicate uncertainty: "[unclear: possible interpretation]".
+- ONLY RESPOND WITH THE TRANSLATED TEXT. DO NOT ADD ANY OTHER TEXT, EXPLANATIONS, OR CONTEXTUAL INFORMATION.
+""".strip()
+
+
 class AzureOpenAIClient:
     """Handles Azure OpenAI API connection and basic configuration"""
-    
+
     def __init__(self):
         # Initialize client with configuration from environment
         self.client = AsyncAzureOpenAI(
@@ -26,21 +47,22 @@ class AzureOpenAIClient:
             azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT", "")
         )
         self.available = self._check_configuration()
-        
+
     def _check_configuration(self) -> bool:
         """Check if the client is properly configured"""
         required_vars = ["AZURE_OPENAI_API_KEY", "AZURE_OPENAI_ENDPOINT"]
         missing = [var for var in required_vars if not os.getenv(var)]
-        
+
         if missing:
             logger.warning(f"Azure OpenAI client missing configuration: {', '.join(missing)}")
             return False
             
         return True
 
+
 class ProcessingStrategy(ABC):
     """Abstract base strategy for different audio processing operations"""
-    
+
     @abstractmethod
     async def process(self, data: Any) -> Any:
         """Process the input data according to the strategy"""
@@ -53,7 +75,7 @@ class TranscriptionStrategy(ProcessingStrategy):
     def __init__(self, client: AzureOpenAIClient):
         self.client = client
         self.model = os.getenv("AZURE_WHISPER_DEPLOYMENT", "whisper")
-        
+
     @retry(
         stop=stop_after_attempt(2),
         wait=wait_exponential(min=1, max=5),
@@ -64,7 +86,7 @@ class TranscriptionStrategy(ProcessingStrategy):
         if not self.client.available:
             logger.error("Azure OpenAI client not properly configured")
             return None
-        
+
         try:
             # Create a BytesIO object from the audio data
             audio_file = io.BytesIO(audio_data)
@@ -75,7 +97,7 @@ class TranscriptionStrategy(ProcessingStrategy):
                 model=self.model,
                 file=audio_file
             )
-            
+
             return result.text
         except RateLimitError as e:
             logger.warning(f"Rate limit hit during transcription: {e}")
@@ -91,16 +113,14 @@ class TranscriptionStrategy(ProcessingStrategy):
             return None
 
 
-# Update the AudioTranslationStrategy class
-
 class AudioTranslationStrategy(ProcessingStrategy):
     """Strategy for translating audio directly to another language"""
-    
+
     def __init__(self, client: AzureOpenAIClient, target_language: str = "en"):
         self.client = client
         self.target_language = target_language
         self.model = os.getenv("AZURE_GPT4O_RT_DEPLOYMENT", "gpt-4o-mini-realtime-preview")
-        
+
     @retry(
         stop=stop_after_attempt(1),  # Realtime processing should only retry once
         wait=wait_exponential(min=0.5, max=2),
@@ -111,57 +131,50 @@ class AudioTranslationStrategy(ProcessingStrategy):
         if not self.client.available:
             logger.error("Azure OpenAI client not properly configured")
             return None
-        
+
         try:
-            # Check if audio data is too large (Azure has limits)
-            # GPT-4o Real-time typically has a max input size of around 25MB
             max_size = 25 * 1024 * 1024  # 25MB
-            
+
             if len(audio_data) > max_size:
                 logger.warning(f"Audio data size ({len(audio_data)} bytes) exceeds maximum limit, truncating")
                 audio_data = audio_data[:max_size]
-            
+
             # Log the size being sent to Azure
             logger.info(f"Sending {len(audio_data) / 1024:.2f} KB of audio data to Azure Real-time API")
-            
+
             # Use Azure real-time API
             start_time = time.time()
-            
+
             async with self.client.client.beta.realtime.connect(
                 model=self.model
             ) as conn:
-                # Enable audio modality
                 await conn.session.update(session={"modalities": ["audio"]})
-                
-                # Send input audio with language instruction
                 await conn.conversation.item.create(item={
                     "type": "message",
                     "role": "user",
                     "content": [
-                        {"type": "text", "text": f"Translate this audio to {self.target_language}"},
+                        {"type": "text", "text": INTERPRETER_PROMPT},
                         {"type": "input_audio", "audio": base64.b64encode(audio_data).decode()}
                     ]
                 })
-                
-                # Create response and collect output audio
+
                 await conn.response.create()
                 output_audio = bytearray()
-                
+
                 async for event in conn:
                     if event.type == "response.audio.delta":
                         output_audio.extend(base64.b64decode(event.delta))
                     elif event.type == "response.done":
                         break
-                
+
                 processing_time = time.time() - start_time
                 logger.info(f"Audio translation completed in {processing_time:.3f}s: {len(output_audio)} bytes generated from {len(audio_data)} input bytes")
-                
-                # Check if we got reasonable output
+
                 if len(output_audio) < 100 and len(audio_data) > 1000:
                     logger.warning(f"Suspiciously small output ({len(output_audio)} bytes) from large input ({len(audio_data)} bytes)")
-                    
+
                 return bytes(output_audio)
-                
+
         except RateLimitError as e:
             logger.warning(f"Rate limit hit during audio translation: {e}")
             return None
@@ -180,7 +193,7 @@ class TextTranslationStrategy(ProcessingStrategy):
         self.client = client
         self.target_language = target_language
         self.model = os.getenv("AZURE_GPT4O_TEXT_DEPLOYMENT", "gpt-4o")
-        
+
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(min=1, max=10),
@@ -237,38 +250,29 @@ class SpeechProcessor:
     
     Follows Azure best practices for performance, error handling, and resource management
     """
-    
+
     def __init__(self, target_language: str = "en", audio_only: bool = True):
-        # Initialize Azure client (shared connection for efficiency)
         self.client = AzureOpenAIClient()
-        
-        # Audio processing parameters
         self.target_language = target_language
-        self.audio_only = audio_only  # Flag to skip transcription and text translation
-        
-        # Initialize audio translation strategy (always needed)
+        self.audio_only = audio_only
         self.audio_translation_strategy = AudioTranslationStrategy(self.client, target_language)
-        
-        # Initialize other strategies only if not in audio-only mode to save resources
         if not audio_only:
             self.transcription_strategy = TranscriptionStrategy(self.client)
             self.text_translation_strategy = TextTranslationStrategy(self.client, target_language)
-        
+
     async def process(self, audio_data: bytes) -> Dict[str, Any]:
         """
         Process audio data with operations based on mode:
         1. Audio-only mode: Only direct audio translation via GPT-4o Realtime
         2. Full mode: Audio translation + Transcription & text translation
-        
+
         Returns a dictionary with results based on processing mode
         """
         if not audio_data:
             return {"original_text": None, "translated_text": None, "audio": None}
-        
-        # Record start time for performance tracking
+
         start_time = time.time()
-        
-        # In audio-only mode, skip transcription and text translation entirely
+
         if self.audio_only:
             try:
                 # Only process audio translation

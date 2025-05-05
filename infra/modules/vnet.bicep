@@ -14,9 +14,6 @@ param keyVaultReference string
 param envType        string
 
 
-// ────────────────────────────────────────────────────────────
-// Network Security Groups
-// ────────────────────────────────────────────────────────────
 resource managementNSG 'Microsoft.Network/networkSecurityGroups@2020-11-01' = {
   name: 'mgmt-nsg'
   location: location

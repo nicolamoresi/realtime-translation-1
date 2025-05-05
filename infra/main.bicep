@@ -41,7 +41,7 @@ param openAiModelName         string = 'gpt-4o'
 param openAiModelVersion      string = '2024-11-20'
 param openAiCapacity          int    = 80
 
-/*──────────── Resources ────────────*/
+
 resource livetalkRG 'Microsoft.Resources/resourceGroups@2021-04-01' = {
   name: rgName
   location: location
@@ -52,7 +52,6 @@ resource keyVault 'Microsoft.KeyVault/vaults@2021-06-01-preview' existing = {
   name: keyVaultName
 }
 
-/*──────── VNet (returns containerAppsSubnetId) ────────*/
 module vnetModule './modules/vnet.bicep' = {
   name: 'deployVnet'
   scope: livetalkRG
@@ -63,7 +62,6 @@ module vnetModule './modules/vnet.bicep' = {
   }
 }
 
-/*──────── Log Analytics ────────*/
 module logAnalyticsModule './modules/loga.bicep' = {
   name: 'deployLogAnalytics'
   scope: livetalkRG
@@ -105,7 +103,6 @@ module cosmosDbModule './modules/cosmos.bicep' = {
   }
 }
 
-/*──────── Container Apps env + first app ────────*/
 module containerAppsEnvModule './modules/aca.bicep' = {
   name: 'deployContainerAppsEnv'
   scope: livetalkRG
@@ -136,20 +133,6 @@ module openAiModule './modules/aoai.bicep' = {
     modelVersion: openAiModelVersion
     capacity: openAiCapacity
     tags: { project: 'LiveTalk', environment: environment }
-  }
-}
-
-// =======================================================================
-// Module: Azure Bing Search Resource (applying security best practices)
-// =======================================================================
-module bingSearch './modules/bing.bicep' = {
-  name: 'deployBingSearch'
-  scope: livetalkRG
-  params: {
-    location: location
-    environment: environment
-    keyVaultReference: keyVault.name
-    subscriptionId: subscriptionId
   }
 }
 

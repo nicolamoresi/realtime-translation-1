@@ -1,23 +1,40 @@
-# app/main.py
+"""
+Real-time Translation API
+-------------------------
+Lightweight FastAPI application providing real-time translation services using 
+Azure OpenAI's Realtime API. The application supports audio streaming, text 
+messages, and session management.
+
+Key endpoints:
+- POST /chat/start  → Create session and get session_id
+- POST /chat/message → Send text for translation
+- WS /ws/audio → Stream audio with control messages
+- POST /chat/stop → Close session and free resources
+
+Uses Azure OpenAI Realtime API for efficient streaming translation with minimal latency.
+"""
 import os
 import sys
 import time
 import asyncio
 import logging
-
-import json
+import uuid
 from logging.handlers import RotatingFileHandler
 import psutil
+from base64 import b64decode
+from typing import Optional
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, status, Depends, HTTPException, Body
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, status, Depends, HTTPException, Header, Body
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from fastapi.responses import JSONResponse
 from starlette.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
 from app.auth import create_token, validate_token, AuthError
-from app.router import ChatMediator
-from app.processor import AzureOpenAIClient, SpeechProcessor
 from app.user import User, UserCreate, UserLogin, TokenResponse, UserResponse, user_db
 
+# Import realtime translation components
+from app.realtime import RealtimeClient
 
 # Configure logging
 def setup_logging():
@@ -49,28 +66,15 @@ def setup_logging():
 # Initialize logging
 logger = setup_logging()
 
-async def buffer_cleanup_task():
-    """Background task to periodically clean up old audio buffers and ping connections"""
-    while True:
-        try:
-            await chat_mediator.cleanup_old_buffers()
-            
-            # Ping all video connections to keep them alive
-            for room_id, users in chat_mediator.video_sessions.items():
-                for user_id, ws in users.items():
-                    try:
-                        if ws.client_state.name == "CONNECTED":
-                            await ws.send_json({"type": "ping", "timestamp": time.time()})
-                    except Exception as e:
-                        logger.error(f"Error pinging video connection for {user_id}: {e}")
-                        
-        except Exception as e:
-            logger.error(f"Error in buffer cleanup task: {e}")
-        
-        # Run every 5 seconds
-        await asyncio.sleep(5)
+# Application state
+app = FastAPI(title="Real-time Translation")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
-app = FastAPI()
+# Session management
+sessions: dict[str, RealtimeClient] = {}  # session_id -> RealtimeClient
+user_sessions: dict[str, str] = {}        # user_id -> session_id
+session_users: dict[str, str] = {}        # session_id -> user_id
+track_ids: dict[str, str] = {}            # session_id -> current audio track
 
 # Add CORS middleware
 app.add_middleware(
@@ -81,77 +85,170 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Add this to the app startup event handler
+# Background task to periodically clean up resources
+async def resource_cleanup_task():
+    """Azure-recommended background task to maintain resource efficiency"""
+    while True:
+        try:
+            # Clean up inactive sessions (5-minute timeout)
+            current_time = time.time()
+            inactive_sessions = []
+            
+            for session_id, client in sessions.items():
+                # Check if client has been inactive for too long
+                last_activity = getattr(client, "last_activity", 0)
+                if current_time - last_activity > 300:  # 5 minutes
+                    inactive_sessions.append(session_id)
+            for session_id in inactive_sessions:
+                logger.info(f"Cleaning up inactive session {session_id}")
+                await cleanup_session(session_id)
+                
+        except Exception as e:
+            logger.error(f"Error in resource cleanup task: {e}", exc_info=True)
+        
+        # Run every 60 seconds (Azure recommended interval)
+        await asyncio.sleep(60)
+
 @app.on_event("startup")
 async def startup_event():
     """Start background tasks on application startup"""
-    # Start the buffer cleanup task
-    asyncio.create_task(buffer_cleanup_task())
-    logger.info("Started audio buffer cleanup background task")
-
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
-
-# Initialize chat mediator
-chat_mediator = ChatMediator()
-
-# Initialize Azure OpenAI client
-openai_client = AzureOpenAIClient()
-
-# Initialize speech processor
-speech_processor = SpeechProcessor()
+    # Start the resource cleanup task
+    asyncio.create_task(resource_cleanup_task())
+    logger.info("Started resource cleanup background task")
 
 def log_memory_usage():
+    """Log current process memory usage for Azure monitoring"""
     process = psutil.Process(os.getpid())
     memory_info = process.memory_info()
     logger.info(f"Memory usage: {memory_info.rss / 1024 / 1024:.2f} MB")
 
+# Helper functions
+def generate_user_id(username: str) -> str:
+    """
+    Generate a unique user ID with random suffix for anonymous users.
     
-async def connection_monitor(ws: WebSocket, user_id: str, room_id: str, last_data_time: asyncio.Event):
-    ping_interval = 45  # seconds - increased from 30 for better stability
-    ping_timeout = 15   # seconds
-    while True:
+    Args:
+        username: The username
+        
+    Returns:
+        A unique user ID
+    """
+    if username.startswith("anonymous-"):
+        # Add a random UUID suffix for anonymous users
+        session_id = str(uuid.uuid4())[:8]
+        return f"{username}_{session_id}"
+    return username
+
+async def cleanup_session(session_id: str) -> None:
+    """
+    Clean up a session and free all associated resources.
+    
+    Args:
+        session_id: The session ID to clean up
+    """
+    client = sessions.pop(session_id, None)
+    track_ids.pop(session_id, None)
+    
+    # Remove user association
+    user_id = session_users.pop(session_id, None)
+    if user_id:
+        user_sessions.pop(user_id, None)
+    
+    # Disconnect client if connected
+    if client and client.is_connected():
+        await client.disconnect()
+        logger.info(f"Disconnected client for session {session_id}")
+
+def get_client_or_404(session_id: str) -> RealtimeClient:
+    """
+    Get a client by session ID or raise a 404 error.
+    
+    Args:
+        session_id: The session ID
+        
+    Returns:
+        The RealtimeClient for this session
+        
+    Raises:
+        HTTPException: If session not found
+    """
+    client = sessions.get(session_id)
+    if not client:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Invalid session_id"
+        )
+    return client
+
+# Session setup
+async def setup_realtime_client(session_id: str, user_id: str, system_prompt: str) -> None:
+    """
+    Set up a new RealtimeClient instance with event handlers.
+    
+    Args:
+        session_id: Unique session identifier
+        user_id: User identifier
+        system_prompt: System instructions for the AI
+    """
+    # Create client with system prompt
+    realtime_client = RealtimeClient(system_prompt=system_prompt)
+    setattr(realtime_client, "last_activity", time.time())
+    
+    # Track session
+    sessions[session_id] = realtime_client
+    user_sessions[user_id] = session_id
+    session_users[session_id] = user_id
+    track_ids[session_id] = str(uuid.uuid4())
+    
+    # Set up event handlers
+    async def handle_conversation_updated(event):
+        # Update last activity timestamp
+        setattr(realtime_client, "last_activity", time.time())
+    
+    async def handle_item_completed(event):
+        """Log transcript when the assistant finishes a message."""
         try:
-            # Wait for inactivity
-            try:
-                await asyncio.wait_for(last_data_time.wait(), timeout=ping_interval)
-                # Data received, reset the event
-                last_data_time.clear()
-                logger.debug(f"Activity detected for {user_id} in room {room_id}")
-            except asyncio.TimeoutError:
-                # No data received in ping_interval, send ping
-                logger.debug(f"No data received from {user_id} in {ping_interval}s, sending ping")
-                ping_payload = {"type": "ping", "timestamp": time.time()}
-                await ws.send_json(ping_payload)
-                
-                # Wait for pong response
-                try:
-                    await asyncio.wait_for(last_data_time.wait(), timeout=ping_timeout)
-                    last_data_time.clear()
-                    logger.debug(f"Received activity from {user_id} after ping")
-                except asyncio.TimeoutError:
-                    # No pong received, connection may be dead
-                    logger.warning(f"No response to ping from {user_id} after {ping_timeout}s, closing connection")
-                    return  # Exit monitor, which will trigger connection cleanup
-        except asyncio.CancelledError:
-            logger.info(f"Connection monitor for {user_id} cancelled")
-            raise
+            item = event.get("item", {})
+            transcript = item.get("formatted", {}).get("transcript", "")
+            if transcript:
+                logger.info(f"Session {session_id} Assistant: {transcript}")
         except Exception as e:
-            logger.error(f"Error in connection monitor for {user_id}: {e}")
-            return  # Exit on any error
+            logger.error(f"Error processing completed item: {e}")
+    
+    async def handle_conversation_interrupt(event):
+        track_ids[session_id] = str(uuid.uuid4())
+    
+    async def handle_error(event):
+        logger.error(f"Realtime error in session {session_id}: {event}")
+
+    realtime_client.on("conversation.updated", handle_conversation_updated)
+    realtime_client.on("conversation.item.completed", handle_item_completed)
+    realtime_client.on("conversation.interrupted", handle_conversation_interrupt)
+    realtime_client.on("error", handle_error)
 
 
+class ChatPayload(BaseModel):
+    """Either a text message, or an audio chunk in base64."""
+    content: Optional[str] = None          # plain text
+    audio:   Optional[bytes] = None          # base64‑encoded bytes (webm / wav / pcm16)
 
+    @classmethod
+    def validate_payload(cls, v: "ChatPayload"):   # noqa: N805
+        if not (v.content or v.audio):
+            raise ValueError("Either content or audio must be provided")
+        return v
+
+
+# User authentication endpoints
 @app.post("/signup", response_model=TokenResponse)
 async def signup(user_data: UserCreate):
     """Register a new user and return an access token"""
-    # Check if username already exists
     if user_db.user_exists(user_data.username):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Username already registered"
         )
-        
-    # Check if email already exists
+
     if user_db.email_exists(user_data.email):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -167,12 +264,13 @@ async def signup(user_data: UserCreate):
     
     # Add user to database
     user_db.add_user(new_user)
-    
+
     # Create access token
     token = create_token(new_user.username)
     
     logger.info(f"User registered: {new_user.username}")
     return TokenResponse(access_token=token)
+
 
 @app.post("/token", response_model=TokenResponse)
 async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
@@ -195,6 +293,7 @@ async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(
     logger.info(f"User logged in via oauth2: {user.username}")
     return TokenResponse(access_token=token)
 
+
 @app.post("/signin", response_model=TokenResponse)
 async def signin(user_data: UserLogin):
     """Sign in and get an access token"""
@@ -215,6 +314,7 @@ async def signin(user_data: UserLogin):
     logger.info(f"User signed in: {user.username}")
     return TokenResponse(access_token=token)
 
+
 @app.get("/me", response_model=UserResponse)
 async def get_current_user(token: str = Depends(oauth2_scheme)):
     """Get current user profile"""
@@ -229,10 +329,9 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
             )
         
         if username == "demo_user":
-            # Create a demo user on the fly
             demo_user = User(username="demo_user", email="demo@example.com")
             return UserResponse(**demo_user.to_dict())
-            
+
         return UserResponse(**user.to_dict())  #type: ignore
     except AuthError as e:
         raise HTTPException(
@@ -240,7 +339,31 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
             detail=e.message
         )
 
-# Demo token endpoint for testing
+
+@app.get("/anonymous-access/{room_id}", response_model=TokenResponse)
+async def get_anonymous_access(room_id: str):
+    """Generate an anonymous user token for a specific room"""
+    # Count existing anonymous users
+    anonymous_count = 0
+    for user_id in user_sessions.keys():
+        if user_id.startswith("anonymous-"):
+            try:
+                # Extract number from anonymous-X format
+                num = int(user_id.split("-")[1].split("_")[0])
+                anonymous_count = max(anonymous_count, num)
+            except (ValueError, IndexError):
+                pass
+    
+    # Generate new anonymous username
+    anonymous_username = f"anonymous-{anonymous_count + 1}"
+    
+    # Create an access token for this anonymous user
+    token = create_token(anonymous_username)
+    
+    logger.info(f"Created anonymous access for {anonymous_username} in room {room_id}")
+    return TokenResponse(access_token=token)
+
+
 @app.get("/demo-token", response_model=TokenResponse)
 async def get_demo_token():
     """Get a demo token for testing"""
@@ -249,283 +372,321 @@ async def get_demo_token():
     return TokenResponse(access_token=token)
 
 
-@app.websocket("/ws/voice/{room_id}")
-async def ws_voice(ws: WebSocket, room_id: str):
+# New session management endpoints
+@app.post("/chat/start")
+async def start_chat(token: str = Depends(oauth2_scheme)):
     """
-    WebSocket endpoint for voice processing with optional audio-only mode
-    that skips transcription and text translation operations
-    """
-    # Track connection variables for cleanup
-    user_id = None
-    monitor_task = None
-    processor = None
+    Start a new chat session and return a session ID.
     
+    Returns:
+        A JSON response with session_id and welcome message
+    """
     try:
-        # --- Connection setup and authentication ---
-        token = ws.query_params.get("token")
-        if not token:
-            await ws.close(code=status.WS_1008_POLICY_VIOLATION, reason="Missing authentication")
-            return
-            
-        # Validate token
-        try:
-            user_id = validate_token(token)
-        except Exception as e:
-            logger.error(f"Token validation error: {e}")
-            await ws.close(code=status.WS_1008_POLICY_VIOLATION, reason="Invalid authentication")
-            return
-            
-        # Extract parameters from query params
-        target_language = ws.query_params.get("target_lang", "en")
-        audio_only_param = ws.query_params.get("audio_only", None)
-        audio_only = audio_only_param.lower() in ["false", "1"] if audio_only_param else True
+        # Validate user token
+        username = validate_token(token)
+        user_id = generate_user_id(username)
+        
+        # Check if user already has an active session
+        if user_id in user_sessions:
+            old_session_id = user_sessions[user_id]
+            # Clean up old session
+            await cleanup_session(old_session_id)
+            logger.info(f"Cleaned up previous session for user {user_id}")
+        
+        # Create new session
+        session_id = str(uuid.uuid4())
+        
+        # Define system prompt
+        system_prompt = """
+        You are an interpreter who can help people who speak different languages interact with chinese-speaking people.
+        Your sole function is to translate the input from the user accurately and with proper grammar, maintaining the original meaning and tone of the message.
 
+        Whenever the user speaks in English, you will translate it to Portuguese.
+        Whenever the user speaks in Portuguese, you will translate it to English.
+
+        Act like an interpreter, DO NOT add, omit, or alter any information.
+        DO NOT provide explanations, opinions, or any additional text beyond the direct translation.
+        DO NOT respond to the speakers' questions or asks and DO NOT add your own thoughts. You only need to translate the audio input coming from the two speakers.
+        You are not aware of any other facts, knowledge, or context beyond the audio input you are translating.
+        Wait until the speaker is done speaking before you start translating, and translate the entire audio inputs in one go. If the speaker is providing a series of instructions, wait until the end of the instructions before translating.
+
+        # Steps
+
+        1. **Receive Audio Input**: Process the provided audio input.
+        2. **Transcribe the Audio**: Accurately transcribe the spoken content into text in English.
+        3. **Translate**: Convert the transcribed text to the other language, ensuring clarity, correctness, and cultural appropriateness.
+        4. **Maintain Original Meaning**: Preserve the original intent, context, and tone of the message.
+        5. **Check Grammar and Style**: Ensure the translated text adheres to proper grammar, spelling, and sentence structure suitable for the other language.
+
+        # Output Format
+
+        Provide the output as plain text in the same language spoken by the respective speaker. 
+        Ensure that it is organized and easy to read, but avoid adding extra formatting unless necessary for context.
+
+        # Notes
+
+        - If the original audio includes idioms, cultural references, or expressions, adapt them into their closest equivalents where possible while retaining the intended meaning.
+        - Handle technical terms with their closest translation or state them as-is if no appropriate equivalent exists.
+        - In cases of unclear audio, provide the best-guess translation and indicate uncertainty with a note (e.g., "[unclear: possible interpretation]"). 
+        - Do not include extraneous details or analysis not present in the user's input.
+        - ONLY RESPOND WITH THE TRANSLATED TEXT. DO NOT ADD ANY OTHER TEXT, EXPLANATIONS, OR CONTEXTUAL INFORMATION.
+        """
+        
+        # Set up realtime client
+        await setup_realtime_client(session_id, user_id, system_prompt)
+        
+        logger.info(f"Created new session {session_id} for user {user_id}")
+        
+        return JSONResponse({
+            "session_id": session_id,
+            "message": "Welcome to the real-time translation service. Press the microphone button to start speaking."
+        })
+    except AuthError as e:
+        raise HTTPException(
+            status_code=e.code,
+            detail=e.message
+        )
+    except Exception as e:
+        logger.error(f"Error starting chat: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to start chat session"
+        )
+
+
+@app.post("/chat/message")
+async def send_message(
+    payload: ChatPayload = Depends(ChatPayload.validate_payload),
+    x_session_id: str = Header(..., alias="X-Session-ID"),
+):
+    """
+    Process user input and return the assistant's response with text and audio.
+    
+    Instead of just enqueuing the message, this endpoint waits for the model response
+    and returns the complete answer including text transcript and audio data.
+    """
+    try:
+        client = get_client_or_404(x_session_id)
+
+        if not client.is_connected():
+            await client.connect()
+
+        if not payload.audio:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Audio data is required",
+            )
+        try:
+            # Decode base64 audio
+            raw_audio = b64decode(payload.audio, validate=True)
+            
+            # Audio conversion is already handled by client.append_input_audio
+            await client.append_input_audio(raw_audio)
+            logger.info(f"Session {x_session_id} sent audio ({len(raw_audio)} bytes)")
+            
+        except Exception as e:
+            logger.error(f"Audio processing error: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid audio data",
+            ) from e
+        
+        # After sending the input, create a response
+        await client.create_response()
+        
+        # Wait for the model to process and respond (with timeout)
+        try:
+            # Wait for the completed item with the assistant's response
+            response_data = await asyncio.wait_for(
+                client.wait_for_next_completed_item(), 
+                timeout=10.0  # Azure best practice: set reasonable timeout
+            )
+            
+            # Extract response data from the completed item
+            item = response_data.get("item", {})
+            
+            # Get the text transcript
+            reply_text = item.get("formatted", {}).get("transcript", "")
+            
+            # Get the audio data if available
+            reply_audio = None
+            if audio_content := next((c for c in item.get("content", []) if c.get("type") == "audio"), None):
+                if audio_data := audio_content.get("data"):
+                    # Convert to base64 for sending to frontend
+                    from base64 import b64encode
+                    reply_audio = b64encode(bytes(audio_data)).decode("utf-8")
+            
+            # Update last activity
+            setattr(client, "last_activity", time.time())
+            
+            # Log the successful exchange
+            logger.info(f"Session {x_session_id} received assistant reply: {reply_text[:50]}...")
+
+            if not client.is_connected():
+                await client.disconnect()
+            
+            # Return both text and audio to the frontend
+            return {
+                "status": "success",
+                "reply": reply_text,
+                "audio_base64": reply_audio
+            }
+            
+        except asyncio.TimeoutError:
+            logger.warning(f"Timeout waiting for response in session {x_session_id}")
+            return {
+                "status": "timeout",
+                "echo": payload.content,
+                "message": "Request is still processing. Try again with a shorter input."
+            }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Error in /chat/message: %s", e, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to process message",
+        )
+
+
+@app.post("/chat/stop")
+async def stop_chat(x_session_id: str = Header(..., alias="X-Session-ID")):
+    """
+    Stop a chat session and clean up resources.
+    
+    Args:
+        x_session_id: Session ID header
+        
+    Returns:
+        Status confirmation
+    """
+    try:
+        # Make sure session exists
+        _ = get_client_or_404(x_session_id)
+        
+        # Clean up the session
+        await cleanup_session(x_session_id)
+        logger.info(f"Closed session {x_session_id}")
+        
+        return {"status": "closed"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error stopping chat: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to stop chat session"
+        )
+
+# WebSocket endpoint for audio streaming
+@app.websocket("/ws/audio")
+async def websocket_audio(ws: WebSocket, x_session_id: str = Header(..., alias="X-Session-ID")):
+    """
+    WebSocket endpoint for streaming audio with control messages.
+    
+    Protocol:
+    - Binary frames = raw PCM16 audio data to be processed
+    - Text frame "start" = initiate the Azure OpenAI connection
+    - Text frame "end" = terminate the connection gracefully
+    
+    Args:
+        ws: The WebSocket connection
+        x_session_id: Session ID header
+    """
+    try:
+        # Validate session before accepting connection
+        client = get_client_or_404(x_session_id)
+        
         # Accept the connection
         await ws.accept()
-        logger.info(f"Voice WebSocket connected: user={user_id}, room={room_id}, language={target_language}, audio_only={audio_only}")
+        logger.info(f"Audio WebSocket connected for session {x_session_id}")
         
-        # Create dedicated speech processor for this connection
-        processor = SpeechProcessor(target_language=target_language, audio_only=audio_only)
-        
-        # Create activity tracking event
-        last_data_time = asyncio.Event()
-        
-        # Start connection monitor
-        monitor_task = asyncio.create_task(
-            connection_monitor(ws, user_id, room_id, last_data_time)
-        )
-        
-        # Add to mediator
-        await chat_mediator.add_voice_connection(room_id, user_id, ws)
-        
-        # --- Main receive loop ---
         while True:
-            try:
-                # Verify connection state
-                if ws.client_state.name != "CONNECTED":
-                    logger.warning(f"WebSocket for {user_id} is in state {ws.client_state.name}, closing")
-                    break
-                    
-                # Receive message with timeout
-                message = await asyncio.wait_for(ws.receive(), timeout=30.0)
-                last_data_time.set()  # Signal activity
+            # Receive a message
+            frame = await ws.receive()
+            
+            # Update last activity timestamp
+            setattr(client, "last_activity", time.time())
+            
+            # Process text control messages
+            if "text" in frame:
+                msg = frame["text"]
                 
-                # Process binary audio data
-                if "bytes" in message:
-                    audio_data = message["bytes"]
-                    logger.debug(f"Received {len(audio_data)} bytes of audio from {user_id}")
-                    
-                    # Process through the router
-                    asyncio.create_task(
-                        chat_mediator.process_audio_stream(
-                            room_id, 
-                            user_id, 
-                            audio_data,
-                            processor
-                        )
-                    )
-                
-                # Process text control messages
-                elif "text" in message:
+                # Handle connection initialization
+                if msg == "start":
                     try:
-                        json_data = json.loads(message["text"])
-                        message_type = json_data.get("type", "unknown")
-                        
-                        if message_type == "pong":
-                            logger.debug(f"Received pong from {user_id}")
-                            
-                        elif message_type == "config":
-                            # Handle language and mode change
-                            new_language = json_data.get("target_language")
-                            audio_only_param = json_data.get("audio_only")
-                            
-                            should_update = False
-                            
-                            if new_language and new_language != target_language:
-                                target_language = new_language
-                                should_update = True
-                            
-                            if audio_only_param is not None:
-                                audio_only = audio_only_param
-                                should_update = True
-                            
-                            if should_update:
-                                # Create new processor with updated settings
-                                processor = SpeechProcessor(
-                                    target_language=target_language, 
-                                    audio_only=audio_only
-                                )
-                                
-                                logger.info(f"Updated settings for {user_id}: lang={target_language}, audio_only={audio_only}")
-                                await ws.send_json({
-                                    "type": "config_update",
-                                    "status": "success",
-                                    "target_language": target_language,
-                                    "audio_only": audio_only
-                                })
-                        else:
-                            logger.debug(f"Received text message: {message['text'][:100]}")
-                            
-                    except json.JSONDecodeError:
-                        logger.debug(f"Received non-JSON text from {user_id}")
-                    
-            except WebSocketDisconnect:
-                logger.info(f"WebSocket disconnected for {user_id}")
-                break
-            except asyncio.TimeoutError:
-                # This is not an error, just check if the connection is still active
-                continue
-            except Exception as e:
-                logger.error(f"Error in voice WebSocket for {user_id}: {e}")
-                break
+                        # Connect to Azure OpenAI
+                        await client.connect()
+                        logger.info(f"Realtime Azure connection established for session {x_session_id}")
+                    except Exception as e:
+                        logger.error(f"Failed to connect to Azure: {e}", exc_info=True)
+                        await ws.close(code=1011, reason=str(e))
+                        return
                 
-    except Exception as e:
-        logger.error(f"Unhandled exception in voice websocket: {e}", exc_info=True)
-        
-    finally:
-        # --- Cleanup resources ---
-        if user_id:
-            await chat_mediator.remove_connection(room_id, user_id)
+                # Handle graceful termination
+                elif msg == "end":
+                    await client.disconnect()
+                    await ws.close(code=1000)
+                    logger.info(f"WebSocket closed gracefully for session {x_session_id}")
+                    return
+                
+                # Reject unsupported messages
+                else:
+                    logger.warning(f"Unsupported control message: {msg}")
+                    await ws.close(code=1003, reason="Unsupported control message")
+                    return
             
-        if monitor_task and not monitor_task.done():
-            monitor_task.cancel()
-            try:
-                await asyncio.wait_for(
-                    asyncio.gather(monitor_task, return_exceptions=True),
-                    timeout=2.0
-                )
-            except asyncio.TimeoutError:
-                logger.warning(f"Timeout waiting for monitor task cleanup for {user_id}")
+            # Process binary audio data
+            elif "bytes" in frame:
+                audio_data = frame["bytes"]
                 
+                # Only process if connected to Azure
+                if client.is_connected():
+                    await client.append_input_audio(audio_data)
+                    logger.debug(f"Processed {len(audio_data)} bytes of audio for session {x_session_id}")
+                else:
+                    logger.warning(f"Received audio data before connection started for {x_session_id}")
+            
+            # Reject other frame types
+            else:
+                logger.warning(f"Received unsupported frame type")
+                await ws.close(code=1003)
+                return
+                
+    except WebSocketDisconnect:
+        logger.info(f"WebSocket disconnected for session {x_session_id}")
+    except HTTPException as e:
+        logger.error(f"HTTP error in WebSocket: {e.detail}")
         try:
-            await ws.close()
-        except Exception as e:
-            logger.debug(f"Error during WebSocket closure: {e}")
-        
-        log_memory_usage()
-
-
-@app.websocket("/ws/video/{room_id}")
-async def ws_video(ws: WebSocket, room_id: str):
-    """
-    WebSocket endpoint for video - routes video data between clients
-    without processing (following the requirements)
-    """
-    # Track connection variables for cleanup
-    user_id = None
-    monitor_task = None
-    
-    try:
-        # --- Connection setup and authentication ---
-        token = ws.query_params.get("token")
-        if not token:
-            await ws.close(code=status.WS_1008_POLICY_VIOLATION, reason="Missing authentication")
-            return
-            
-        # Validate token
-        try:
-            user_id = validate_token(token)
-        except Exception as e:
-            logger.error(f"Token validation error: {e}")
-            await ws.close(code=status.WS_1008_POLICY_VIOLATION, reason="Invalid authentication")
-            return
-            
-        # Accept connection
-        await ws.accept()
-        logger.info(f"Video WebSocket connected: user={user_id}, room={room_id}")
-        
-        # Activity tracking
-        last_data_time = asyncio.Event()
-        
-        # Start connection monitor
-        monitor_task = asyncio.create_task(
-            connection_monitor(ws, user_id, room_id, last_data_time)
-        )
-        
-        # Add to mediator
-        await chat_mediator.add_video_connection(room_id, user_id, ws)
-        
-        # --- Main receive loop ---
-        while True:
-            try:
-                # Check connection state
-                if ws.client_state.name != "CONNECTED":
-                    logger.warning(f"WebSocket for {user_id} is in state {ws.client_state.name}, closing")
-                    break
-                    
-                # Receive with timeout (Azure best practice)
-                message = await asyncio.wait_for(ws.receive(), timeout=30.0)
-                last_data_time.set()  # Signal activity
-                
-                # Process binary data (video frames)
-                if "bytes" in message:
-                    video_data = message["bytes"]
-                    
-                    # Log receipt of data with tracking info (for observability)
-                    frame_size = len(video_data)
-                    logger.debug(f"Received video frame: {frame_size} bytes from {user_id}")
-                    
-                    # Simply route video to other participants without processing
-                    asyncio.create_task(
-                        chat_mediator.route_video(room_id, user_id, video_data)
-                    )
-                    
-                # Process text messages (pongs, control messages)
-                elif "text" in message:
-                    try:
-                        json_data = json.loads(message["text"])
-                        message_type = json_data.get("type", "unknown")
-                        
-                        if message_type == "pong":
-                            logger.debug(f"Received pong from {user_id}")
-                        else:
-                            logger.debug(f"Received text message type: {message_type}")
-                    except json.JSONDecodeError:
-                        pass
-                        
-            except WebSocketDisconnect:
-                logger.info(f"Video WebSocket disconnected for {user_id}")
-                break
-            except asyncio.TimeoutError:
-                # Not an error, just check connection
-                continue
-            except Exception as e:
-                logger.error(f"Error in video WebSocket for {user_id}: {e}")
-                break
-                
-    except Exception as e:
-        logger.error(f"Unhandled exception in video websocket: {e}", exc_info=True)
-        
-    finally:
-        # --- Cleanup resources following Azure best practices ---
-        
-        # Remove from mediator
-        if user_id:
-            await chat_mediator.remove_connection(room_id, user_id)
-            
-        # Cancel monitor task
-        if monitor_task and not monitor_task.done():
-            monitor_task.cancel()
-            try:
-                await asyncio.wait_for(
-                    asyncio.gather(monitor_task, return_exceptions=True),
-                    timeout=2.0
-                )
-            except asyncio.TimeoutError:
-                logger.warning(f"Timeout waiting for monitor task cleanup for {user_id}")
-                
-        # Close WebSocket gracefully
-        try:
-            await ws.close()
-        except Exception:
+            await ws.close(code=1008, reason=e.detail)
+        except:
             pass
-            
-        # Log metrics
+    except Exception as e:
+        logger.error(f"Error in audio WebSocket: {e}", exc_info=True)
+        try:
+            await ws.close(code=1011, reason=str(e))
+        except:
+            pass
+    finally:
+        # Log memory usage for Azure monitoring
         log_memory_usage()
-
 
 # Health check endpoint
 @app.get("/health")
 async def health_check():
-    log_memory_usage()
-    return {"status": "ok", "timestamp": time.time()}
+    """Azure-recommended health check endpoint with detailed metrics"""
+    memory_usage = psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024
+    
+    active_sessions = len(sessions)
+    
+    return {
+        "status": "ok",
+        "timestamp": time.time(),
+        "metrics": {
+            "memory_mb": round(memory_usage, 2),
+            "active_sessions": active_sessions,
+            "user_count": len(set(session_users.values()))
+        },
+        "version": "1.0.0"
+    }

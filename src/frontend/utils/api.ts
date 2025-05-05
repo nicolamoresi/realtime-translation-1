@@ -1,5 +1,7 @@
 export const API_BASE = process.env.NEXT_PUBLIC_API_BASE || 'http://localhost:8000'
 
+// Authentication functions - keep existing ones
+
 export async function signup(username: string, email: string, password: string) {
   const res = await fetch(`${API_BASE}/signup`, {
     method: 'POST',
@@ -34,7 +36,23 @@ export async function signin(username: string, password: string) {
   return res.json()
 }
 
-// OAuth2 compatible token endpoint (for compatibility with some libraries)
+export async function getAnonymousAccess(roomId: string) {
+  const response = await fetch(`${API_BASE}/anonymous-access/${roomId}`, {
+    method: 'GET',
+    headers: {
+      'Content-Type': 'application/json'
+    }
+  });
+  
+  if (!response.ok) {
+    const error = await response.json();
+    throw new Error(error.detail || 'Failed to get anonymous access');
+  }
+  
+  return response.json();
+}
+
+// OAuth2 token endpoint
 export async function getToken(username: string, password: string) {
   const res = await fetch(`${API_BASE}/token`, {
     method: 'POST',
@@ -56,18 +74,7 @@ export async function getToken(username: string, password: string) {
   return res.json()
 }
 
-// Function to get a demo token for testing
-export async function getDemoToken() {
-  const res = await fetch(`${API_BASE}/demo-token`)
-  
-  if (!res.ok) {
-    throw new Error('Failed to get demo token');
-  }
-  
-  return res.json()
-}
-
-// Function to get user profile
+// User profile
 export async function getUserProfile(token: string) {
   const res = await fetch(`${API_BASE}/me`, {
     headers: {
@@ -80,4 +87,73 @@ export async function getUserProfile(token: string) {
   }
   
   return res.json()
+}
+
+// ---- NEW CHAT API ENDPOINTS ----
+
+// Start a new chat session
+export async function startChatSession(token: string) {
+  const res = await fetch(`${API_BASE}/chat/start`, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${token}`,
+      'Content-Type': 'application/json'
+    }
+  });
+  
+  if (!res.ok) {
+    const errorData = await res.json().catch(() => ({
+      detail: 'Failed to start chat session'
+    }));
+    throw new Error(errorData.detail);
+  }
+  
+  return res.json();
+}
+
+// Send a text message
+export async function sendChatMessage(
+  sessionId: string,
+  content?: string,
+  audioBase64?: string
+) {
+  /* build JSON body – only one of the two keys */
+  const body: Record<string, string> = {}
+  if (content) body.content = content
+  if (audioBase64) body.audio = audioBase64
+
+  const res = await fetch(`${API_BASE}/chat/message`, {
+    method: 'POST',
+    headers: {
+      'X-Session-ID': sessionId,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify(body)
+  })
+
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}))
+    throw new Error(err.detail || 'Failed to send chat message')
+  }
+  return res.json()
+}
+
+// Stop a chat session
+export async function stopChatSession(sessionId: string) {
+  const res = await fetch(`${API_BASE}/chat/stop`, {
+    method: 'POST',
+    headers: {
+      'X-Session-ID': sessionId,
+      'Content-Type': 'application/json'
+    }
+  });
+  
+  if (!res.ok) {
+    const errorData = await res.json().catch(() => ({
+      detail: 'Failed to stop chat session'
+    }));
+    throw new Error(errorData.detail);
+  }
+  
+  return res.json();
 }

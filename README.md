@@ -52,7 +52,7 @@ A minimal demo is included to illustrate full-stack flow:
 
 ## Sequence Diagram
 
-![Sequence Diagram](./.assets/sequence%20diagram.png)
+![Sequence Diagram](./.assets/Sequence-Diagram.png)
 
 **Sequential Chat Flow**  
 The first diagram traces a single interpretation cycle. When a user joins a room, the Next.js UI opens audio & text WebSocket channels, tags the session, and renders the chat canvas. The FastAPI orchestrator registers the user in its in-memory map, adds them via Azure Communication Services Rooms API, then buffers incoming PCM until a pause is detected. That chunk is sent to GPT-4o Realtime; translated audio and transcription deltas stream back and are immediately broadcast over the same WebSockets. The UI plays the audio and appends transcript lines to complete one real-time interpreter loop.
@@ -68,7 +68,7 @@ The final diagram positions Azure Communication Services as the call coordinator
 
 ## Architecture Overview
 
-![C4–C2 Diagram](./.assets/c4%20-%20c2.png)
+![C4–C2 Diagram](./.assets/C4-C3.png)
 
 ### Architecture Overview — Real-Time Multilingual Chat & Voice Translation
 

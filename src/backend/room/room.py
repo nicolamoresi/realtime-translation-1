@@ -7,7 +7,7 @@ to handle state transitions.
 """
 
 from abc import ABC, abstractmethod
-from app.session import SessionStateSubject
+from orchestrator.session import SessionStateSubject
 
 
 class ChatRoomState(ABC):
@@ -31,7 +31,7 @@ class WaitingState(ChatRoomState):
     State representing a chat room in a waiting condition.
     """
 
-    async def handle(self, controller):
+    async def handle(self, controller: 'ChatRoomController'):
         """
         Set the session state to 'WAITING'.
 
@@ -46,7 +46,7 @@ class ActiveState(ChatRoomState):
     State representing an active chat room.
     """
 
-    async def handle(self, controller):
+    async def handle(self, controller: 'ChatRoomController'):
         """
         Set the session state to 'ACTIVE'.
 
@@ -61,7 +61,7 @@ class EndedState(ChatRoomState):
     State representing a chat room that has ended.
     """
 
-    async def handle(self, controller):
+    async def handle(self, controller: 'ChatRoomController'):
         """
         Set the session state to 'ENDED'.
 

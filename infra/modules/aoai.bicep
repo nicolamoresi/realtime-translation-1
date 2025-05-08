@@ -49,7 +49,6 @@ resource openAIService 'Microsoft.CognitiveServices/accounts@2024-10-01' = if (d
   sku: { name: sku }
   properties: {
     customSubDomainName: customSubDomainName
-    apiProperties: { subnet: { id: subnetId } }
     restore: restore
     publicNetworkAccess: 'Disabled'
     networkAcls: {

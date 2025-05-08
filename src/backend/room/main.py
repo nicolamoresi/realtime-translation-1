@@ -13,230 +13,83 @@ Key endpoints:
 
 Uses Azure OpenAI Realtime API for efficient streaming translation with minimal latency.
 """
+
 import os
-import sys
 import time
 import asyncio
-import logging
 import uuid
-from logging.handlers import RotatingFileHandler
 import psutil
 from base64 import b64decode
-from typing import Optional
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, status, Depends, HTTPException, Header, Body
+from starlette.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, status, Depends, HTTPException, Header
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.responses import JSONResponse
-from starlette.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from fastapi_mcp import FastApiMCP
 
-from app.auth import create_token, validate_token, AuthError
-from app.user import User, UserCreate, UserLogin, TokenResponse, UserResponse, user_db
 
-# Import realtime translation components
-from app.realtime import RealtimeClient
+from room import __app__, __author__, __version__, logger
+from orchestrator.auth import create_token, validate_token, AuthError
+from orchestrator.background import lifespan
+from orchestrator.client import RealtimeClient, setup_realtime_client, cleanup_session, get_client_or_404
 
-# Configure logging
-def setup_logging():
-    logger = logging.getLogger()
-    logger.setLevel(logging.INFO)
-    
-    # Console handler
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(logging.INFO)
-    console_format = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    console_handler.setFormatter(console_format)
-    
-    # File handler
-    file_handler = RotatingFileHandler(
-        "app.log", maxBytes=10*1024*1024, backupCount=5
-    )
-    file_handler.setLevel(logging.DEBUG)
-    file_format = logging.Formatter(
-        '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-    )
-    file_handler.setFormatter(file_format)
-    
-    # Add handlers
-    logger.addHandler(console_handler)
-    logger.addHandler(file_handler)
-    
-    return logger
 
-# Initialize logging
-logger = setup_logging()
+tags_metadata: list[dict] = [
+    {
+        "name": "Inference",
+        "description": """
+        Use agents to process multi-modal data for RAG.
+        """,
+    },
+    {
+        "name": "CRUD - Assemblies",
+        "description": "CRUD endpoints for Assembly model.",
+    },
+    {
+        "name": "CRUD - Tools",
+        "description": "CRUD endpoints for Tool model.",
+    },
+    {
+        "name": "CRUD - TextData",
+        "description": "CRUD endpoints for TextData model.",
+    },
+    {
+        "name": "CRUD - ImageData",
+        "description": "CRUD endpoints for ImageData model.",
+    },
+    {
+        "name": "CRUD - AudioData",
+        "description": "CRUD endpoints for AudioData model.",
+    },
+    {
+        "name": "CRUD - VideoData",
+        "description": "CRUD endpoints for VideoData model.",
+    },
+]
 
-# Application state
-app = FastAPI(title="Real-time Translation")
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+description: str = """
+    .
+"""
 
 # Session management
 sessions: dict[str, RealtimeClient] = {}  # session_id -> RealtimeClient
-user_sessions: dict[str, str] = {}        # user_id -> session_id
-session_users: dict[str, str] = {}        # session_id -> user_id
-track_ids: dict[str, str] = {}            # session_id -> current audio track
+user_sessions: dict[str, str]       = {}  # user_id -> session_id
+session_users: dict[str, str]       = {}  # session_id -> user_id
+track_ids: dict[str, str]           = {}  # session_id -> current audio track
 
-# Add CORS middleware
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+app = FastAPI(lifespan=lifespan, title=__app__, version=__version__)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, replace with specific origins
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=["*"]
 )
 
-# Background task to periodically clean up resources
-async def resource_cleanup_task():
-    """Azure-recommended background task to maintain resource efficiency"""
-    while True:
-        try:
-            # Clean up inactive sessions (5-minute timeout)
-            current_time = time.time()
-            inactive_sessions = []
-            
-            for session_id, client in sessions.items():
-                # Check if client has been inactive for too long
-                last_activity = getattr(client, "last_activity", 0)
-                if current_time - last_activity > 300:  # 5 minutes
-                    inactive_sessions.append(session_id)
-            for session_id in inactive_sessions:
-                logger.info(f"Cleaning up inactive session {session_id}")
-                await cleanup_session(session_id)
-                
-        except Exception as e:
-            logger.error(f"Error in resource cleanup task: {e}", exc_info=True)
-        
-        # Run every 60 seconds (Azure recommended interval)
-        await asyncio.sleep(60)
-
-@app.on_event("startup")
-async def startup_event():
-    """Start background tasks on application startup"""
-    # Start the resource cleanup task
-    asyncio.create_task(resource_cleanup_task())
-    logger.info("Started resource cleanup background task")
-
-def log_memory_usage():
-    """Log current process memory usage for Azure monitoring"""
-    process = psutil.Process(os.getpid())
-    memory_info = process.memory_info()
-    logger.info(f"Memory usage: {memory_info.rss / 1024 / 1024:.2f} MB")
-
-# Helper functions
-def generate_user_id(username: str) -> str:
-    """
-    Generate a unique user ID with random suffix for anonymous users.
-    
-    Args:
-        username: The username
-        
-    Returns:
-        A unique user ID
-    """
-    if username.startswith("anonymous-"):
-        # Add a random UUID suffix for anonymous users
-        session_id = str(uuid.uuid4())[:8]
-        return f"{username}_{session_id}"
-    return username
-
-async def cleanup_session(session_id: str) -> None:
-    """
-    Clean up a session and free all associated resources.
-    
-    Args:
-        session_id: The session ID to clean up
-    """
-    client = sessions.pop(session_id, None)
-    track_ids.pop(session_id, None)
-    
-    # Remove user association
-    user_id = session_users.pop(session_id, None)
-    if user_id:
-        user_sessions.pop(user_id, None)
-    
-    # Disconnect client if connected
-    if client and client.is_connected():
-        await client.disconnect()
-        logger.info(f"Disconnected client for session {session_id}")
-
-def get_client_or_404(session_id: str) -> RealtimeClient:
-    """
-    Get a client by session ID or raise a 404 error.
-    
-    Args:
-        session_id: The session ID
-        
-    Returns:
-        The RealtimeClient for this session
-        
-    Raises:
-        HTTPException: If session not found
-    """
-    client = sessions.get(session_id)
-    if not client:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Invalid session_id"
-        )
-    return client
-
-# Session setup
-async def setup_realtime_client(session_id: str, user_id: str, system_prompt: str) -> None:
-    """
-    Set up a new RealtimeClient instance with event handlers.
-    
-    Args:
-        session_id: Unique session identifier
-        user_id: User identifier
-        system_prompt: System instructions for the AI
-    """
-    # Create client with system prompt
-    realtime_client = RealtimeClient(system_prompt=system_prompt)
-    setattr(realtime_client, "last_activity", time.time())
-    
-    # Track session
-    sessions[session_id] = realtime_client
-    user_sessions[user_id] = session_id
-    session_users[session_id] = user_id
-    track_ids[session_id] = str(uuid.uuid4())
-    
-    # Set up event handlers
-    async def handle_conversation_updated(event):
-        # Update last activity timestamp
-        setattr(realtime_client, "last_activity", time.time())
-    
-    async def handle_item_completed(event):
-        """Log transcript when the assistant finishes a message."""
-        try:
-            item = event.get("item", {})
-            transcript = item.get("formatted", {}).get("transcript", "")
-            if transcript:
-                logger.info(f"Session {session_id} Assistant: {transcript}")
-        except Exception as e:
-            logger.error(f"Error processing completed item: {e}")
-    
-    async def handle_conversation_interrupt(event):
-        track_ids[session_id] = str(uuid.uuid4())
-    
-    async def handle_error(event):
-        logger.error(f"Realtime error in session {session_id}: {event}")
-
-    realtime_client.on("conversation.updated", handle_conversation_updated)
-    realtime_client.on("conversation.item.completed", handle_item_completed)
-    realtime_client.on("conversation.interrupted", handle_conversation_interrupt)
-    realtime_client.on("error", handle_error)
-
-
-class ChatPayload(BaseModel):
-    """Either a text message, or an audio chunk in base64."""
-    content: Optional[str] = None          # plain text
-    audio:   Optional[bytes] = None          # base64‑encoded bytes (webm / wav / pcm16)
-
-    @classmethod
-    def validate_payload(cls, v: "ChatPayload"):   # noqa: N805
-        if not (v.content or v.audio):
-            raise ValueError("Either content or audio must be provided")
-        return v
+mcp = FastApiMCP(app)
 
 
 # User authentication endpoints
@@ -367,7 +220,7 @@ async def get_anonymous_access(room_id: str):
 @app.get("/demo-token", response_model=TokenResponse)
 async def get_demo_token():
     """Get a demo token for testing"""
-    from app.auth import generate_demo_token
+    from orchestrator.auth import generate_demo_token
     token = generate_demo_token()
     return TokenResponse(access_token=token)
 

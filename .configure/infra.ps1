@@ -1,7 +1,7 @@
 $ErrorActionPreference = 'Stop'
 
 # Caminho do .env
-$envFilePath = "src\.env"
+$envFilePath = "src\backend\.env"
 
 # Função para extrair variável do .env
 function Get-EnvValue($name) {

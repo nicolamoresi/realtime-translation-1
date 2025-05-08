@@ -16,12 +16,14 @@ JWT_SECRET = os.getenv("JWT_SECRET", "your-fallback-secret-key-for-development")
 JWT_ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "1440"))  # 24 hours by default
 
+
 class AuthError(Exception):
     """Custom exception for authentication errors"""
     def __init__(self, message: str, code: int = 401):
         self.message = message
         self.code = code
         super().__init__(self.message)
+
 
 def create_token(user_id: str, additional_data: Optional[Dict[str, Any]] = None) -> str:
     """
@@ -56,6 +58,7 @@ def create_token(user_id: str, additional_data: Optional[Dict[str, Any]] = None)
     except Exception as e:
         logger.error(f"Error creating token: {e}")
         raise AuthError("Could not create authentication token")
+
 
 def validate_token(token: str) -> str:
     """

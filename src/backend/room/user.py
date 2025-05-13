@@ -217,17 +217,20 @@ class UserCreate(BaseModel):
     username: str
     email: EmailStr
     password: str
+
     
 class UserLogin(BaseModel):
     """Model for user login"""
     username: str
     password: str
-    
+
+
 class TokenResponse(BaseModel):
     """Model for token response"""
     access_token: str
     token_type: str = "bearer"
-    
+
+
 class UserResponse(BaseModel):
     """Model for user response"""
     username: str

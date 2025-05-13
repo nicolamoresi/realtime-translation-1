@@ -3,9 +3,6 @@
 //-----------------------------------------------
 targetScope = 'subscription'
 
-/*───────────────────────────
-   1. Core deployment inputs
-───────────────────────────*/
 @minLength(1)
 @maxLength(64)
 param rgName string
@@ -24,22 +21,25 @@ param environment string = 'dev'
 param keyVaultName string = 'livetalk-kv'
 param subscriptionId string = subscription().subscriptionId
 
-/* ACR settings */
 @minLength(5)
 @maxLength(50)
 param acrName string = 'livetalkacr'
 var   acrLoginServer = '${acrName}.azurecr.io'
 
-/*--------- OpenAI ---------*/
 param openAiAccountName       string = 'livetalk-openai'
-param openAiCustomDomain      string = 'openai-ctr'
+param openAiCustomDomain      string = 'openai-livetalk'
 param deployOpenAiAccount     bool   = true
 param openAiRestore           bool   = false
 param openAiModelDeployment   string = 'livetalk-4o'
-@allowed([ 'gpt-4o', 'gpt-4o-mini' ])
+
+@allowed([ 'gpt-4o', 'gpt-4o-mini', 'gpt-4o-realtime-preview' ])
 param openAiModelName         string = 'gpt-4o'
 param openAiModelVersion      string = '2024-11-20'
 param openAiCapacity          int    = 80
+
+param eventGridSystemTopicName string = 'livetalk-events'
+param eventGridTopicType string = 'Microsoft.Communication.CommunicationServices'
+param eventGridIdentity object = {} // or use a managed identity if needed
 
 
 resource livetalkRG 'Microsoft.Resources/resourceGroups@2021-04-01' = {
@@ -75,7 +75,6 @@ module logAnalyticsModule './modules/loga.bicep' = {
   }
 }
 
-/*──────── ACR ────────*/
 module acrModule './modules/acr.bicep' = {
   name: 'deployContainerRegistry'
   scope: livetalkRG
@@ -89,7 +88,6 @@ module acrModule './modules/acr.bicep' = {
   }
 }
 
-/*──────── Cosmos DB (unchanged) ────────*/
 module cosmosDbModule './modules/cosmos.bicep' = {
   name: 'deployCosmosDb'
   scope: livetalkRG
@@ -117,7 +115,43 @@ module containerAppsEnvModule './modules/aca.bicep' = {
   }
 }
 
-/*──────── Azure OpenAI ────────*/
+module acsModule './modules/acs.bicep' = {
+  name: 'deployCommunicationServices'
+  scope: livetalkRG
+  params: {
+    location: location
+    infrastructureSubnetId: vnetModule.outputs.containerAppsSubnetId
+    logAnalyticsWorkspaceId: logAnalyticsModule.outputs.workspaceId
+    logAnalyticsWorkspaceName: logAnalyticsModule.outputs.workspaceName
+    envType: environment
+    communicationServiceName: 'livetalk-acs'
+    enableCallAutomation: true
+  }
+  dependsOn: [
+    vnetModule
+    logAnalyticsModule
+  ]
+}
+
+module eventGridModule './modules/event.bicep' = {
+  name: 'deployEventGridSystemTopic'
+  scope: livetalkRG
+  params: {
+    name: eventGridSystemTopicName
+    location: location
+    source: acsModule.outputs.communicationServiceId
+    topicType: eventGridTopicType
+    tags: {
+      project: 'LiveTalk'
+      environment: environment
+    }
+    identity: eventGridIdentity
+  }
+  dependsOn: [
+    acsModule
+  ]
+}
+
 module openAiModule './modules/aoai.bicep' = {
   name: 'deployAzureOpenAI'
   scope: livetalkRG
@@ -136,9 +170,6 @@ module openAiModule './modules/aoai.bicep' = {
   }
 }
 
-// =================================================================
-// Module: Azure Static Web App (enforces HTTPS and CORS policies)
-// =================================================================
 module staticWebApp './modules/staticwapp.bicep' = {
   name: 'deployStaticWebApp'
   scope: livetalkRG
@@ -150,9 +181,6 @@ module staticWebApp './modules/staticwapp.bicep' = {
   }
 }
 
-// ===================================================================================
-// Module: Azure Blob Storage Account (enforces HTTPS-only and uses private endpoints)
-// ===================================================================================
 module storageAccount './modules/blob.bicep' = {
   name: 'deployStorageAccount'
   scope: livetalkRG

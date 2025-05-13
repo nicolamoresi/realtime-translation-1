@@ -157,3 +157,92 @@ export async function stopChatSession(sessionId: string) {
   
   return res.json();
 }
+
+// ROOM API (Azure Communication Rooms)
+
+// Room participant type
+export interface RoomParticipant {
+  id: string;
+  role: string;
+  join_time?: string;
+}
+
+// Create a new room
+export async function createRoom(validForMinutes = 60, participants: RoomParticipant[] = []) {
+  const res = await fetch(`${API_BASE}/rooms`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ valid_for_minutes: validForMinutes, participants })
+  })
+  if (!res.ok) {
+    const error = await res.json().catch(() => ({}))
+    throw new Error(error.detail || 'Failed to create room')
+  }
+  return res.json()
+}
+
+// Get room details
+export async function getRoom(roomId: string) {
+  const res = await fetch(`${API_BASE}/rooms/${roomId}`)
+  if (!res.ok) {
+    const error = await res.json().catch(() => ({}))
+    throw new Error(error.detail || 'Failed to get room')
+  }
+  return res.json()
+}
+
+// List all rooms
+export async function listRooms() {
+  const res = await fetch(`${API_BASE}/rooms`)
+  if (!res.ok) {
+    throw new Error('Failed to list rooms')
+  }
+  return res.json()
+}
+
+// Get ACS token and userId for a room (for joining)
+export async function getRoomToken(roomId: string) {
+  const res = await fetch(`${API_BASE}/rooms/${roomId}/token`, { credentials: 'include' })
+  if (!res.ok) {
+    const error = await res.json().catch(() => ({}))
+    throw new Error(error.detail || 'Failed to get room token')
+  }
+  return res.json()
+}
+
+// Add or update participants in a room
+export async function addOrUpdateParticipants(roomId: string, participants: RoomParticipant[]) {
+  const res = await fetch(`${API_BASE}/rooms/${roomId}/participants`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ participants })
+  })
+  if (!res.ok) {
+    const error = await res.json().catch(() => ({}))
+    throw new Error(error.detail || 'Failed to add/update participants')
+  }
+  return res.json()
+}
+
+// Remove participants from a room
+export async function removeParticipants(roomId: string, participantIds: string[]) {
+  const res = await fetch(`${API_BASE}/rooms/${roomId}/participants/remove`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ participant_ids: participantIds })
+  })
+  if (!res.ok) {
+    const error = await res.json().catch(() => ({}))
+    throw new Error(error.detail || 'Failed to remove participants')
+  }
+  return res.json()
+}
+
+// List participants in a room
+export async function listParticipants(roomId: string) {
+  const res = await fetch(`${API_BASE}/rooms/${roomId}/participants`)
+  if (!res.ok) {
+    throw new Error('Failed to list participants')
+  }
+  return res.json()
+}

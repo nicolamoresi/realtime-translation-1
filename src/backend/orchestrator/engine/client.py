@@ -1,9 +1,7 @@
 """
-Orchestrator client module.
+Client and command abstractions for Azure OpenAI real-time translation.
 
-Defines abstractions for Azure OpenAI real-time translation commands
-and an Invoker context manager to run those commands through the
-AzureRealtimeWebsocket, forwarding audio data between ACS and Azure AI.
+This module defines the AOAITranslationClient base class, the TranslateCommand for translation logic, and the Invoker context manager for orchestrating translation sessions and audio forwarding between ACS and Azure OpenAI.
 """
 
 import os
@@ -11,10 +9,9 @@ import base64
 import logging
 
 from abc import ABC, abstractmethod
-from typing import Optional, Any
+from typing import Optional
 from string import Template
 
-from dotenv import find_dotenv, load_dotenv
 from numpy import ndarray
 
 from fastapi import WebSocket
@@ -31,7 +28,6 @@ from semantic_kernel.contents import AudioContent, RealtimeAudioEvent
 
 # Configure logging
 logger = logging.getLogger(__name__)
-load_dotenv(find_dotenv())
 
 
 INTERPRETER_PROMPT = Template("""
@@ -61,20 +57,23 @@ class AOAITranslationClient(ABC):
     underlying AzureRealtimeWebsocket as an async context manager.
     """
 
-    def __init__(self, ws: WebSocket):
-        """Initialize the translation client with default settings."""
+    def __init__(self, ws: WebSocket, observer=None):
+        """
+        Args:
+            ws (WebSocket): The FastAPI WebSocket connection.
+            observer (Optional[Any]): Optional observer/handler for events.
+        """
         self.kernel = Kernel()
         self._raw_ws = AzureRealtimeWebsocket(
             api_key=os.getenv("AZURE_OPENAI_API_KEY"),
             api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2024-10-01-preview"),
             azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT", "")
         )
-
-        self.create_response: bool   = False
+        self.create_response: bool = False
         self.available = self._check_configuration()
         self.ws: WebSocket = ws
-
         self.settings: AzureRealtimeExecutionSettings
+        self.observer = observer
 
     async def __call__(
         self,
@@ -85,9 +84,9 @@ class AOAITranslationClient(ABC):
         """Prepare and return the AzureRealtimeWebsocket context manager.
 
         Args:
-            settings: Execution settings including prompts and audio formats.
-            create_response: Whether to request an immediate response.
-            kernel: Optional Semantic Kernel instance.
+            settings (AzureRealtimeExecutionSettings): Execution settings including prompts and audio formats.
+            create_response (bool): Whether to request an immediate response.
+            kernel (Optional[Kernel]): Optional Semantic Kernel instance.
 
         Returns:
             An async context manager for AzureRealtimeWebsocket.
@@ -97,19 +96,32 @@ class AOAITranslationClient(ABC):
         if kernel:
             self.kernel = kernel
 
-        # THIS returns an async context manager that will
-        # call __aenter__ / __aexit__ on the AzureRealtimeWebsocket
         return self._raw_ws(
             settings=settings,
             create_response=create_response,
             kernel=self.kernel
         )
 
+    async def send_audio_from_acs(self, audio_data: bytes, meta: dict) -> None:
+        """Send audio from ACS to the model."""
+        await self._raw_ws.send(
+            event=RealtimeAudioEvent(
+                audio=AudioContent(data=audio_data, data_format="base64", inner_content=meta),
+            )
+        )
+
+    async def receive_events(self, audio_output_callback=None):
+        """Async generator for model events, with optional audio callback."""
+        async for event in self._raw_ws.receive(audio_output_callback=audio_output_callback):
+            if self.observer:
+                await self.observer.handle_event(event)
+            yield event
+
     def _check_configuration(self) -> bool:
         """Verify required environment variables are set.
 
         Returns:
-            True if configuration is valid; False otherwise.
+            bool: True if configuration is valid; False otherwise.
         """
         required_vars = ["AZURE_OPENAI_API_KEY", "AZURE_OPENAI_ENDPOINT"]
         missing = [var for var in required_vars if not os.getenv(var)]
@@ -130,14 +142,18 @@ class AOAITranslationClient(ABC):
 
 
 class TranslateCommand(AOAITranslationClient):
-    """Concrete translation command for bidirectional language interpretation."""
+    """Concrete translation command for bidirectional language interpretation.
+
+    Methods:
+        configure(entry_language, exit_language): Set up translation prompt and audio settings.
+    """
 
     def configure(self, entry_language: str, exit_language: str) -> None:
         """Configure the translation prompt and audio settings.
 
         Args:
-            entry_language: Language code of the source audio.
-            exit_language: Language code for the translated output.
+            entry_language (str): Language code of the source audio.
+            exit_language (str): Language code for the translated output.
 
         Raises:
             ValueError: If environment variables are missing.
@@ -159,9 +175,15 @@ class TranslateCommand(AOAITranslationClient):
 
 
 class Invoker:
-    """
-    The Invoker is associated with one or several commands. It sends a request
-    to the command.
+    """Invoker context manager for running translation commands.
+
+    Orchestrates the execution of AOAITranslationClient commands, manages context, and provides methods for audio forwarding between ACS and Azure OpenAI.
+
+    Methods:
+        __aenter__(): Enter context, configure and open websocket.
+        __aexit__(): Exit context, close websocket.
+        _from_realtime_to_acs(audio): Forward audio to ACS.
+        _from_acs_to_realtime(client): Forward audio to Azure OpenAI.
     """
 
     def __init__(
@@ -173,9 +195,9 @@ class Invoker:
         """Initialize the invoker with a command and kernel.
 
         Args:
-            command: A configured AOAITranslationClient subclass.
-            kernel: Semantic Kernel instance for function calls.
-            create_response: Whether to request immediate AI response.
+            command (AOAITranslationClient): A configured AOAITranslationClient subclass.
+            kernel (Optional[Kernel]): Semantic Kernel instance for function calls.
+            create_response (bool): Whether to request immediate AI response.
         """
         self.command = command
         self.kernel = kernel
@@ -200,7 +222,7 @@ class Invoker:
         """Forward model-generated audio to ACS via WebSocket.
 
         Args:
-            audio: PCM audio samples from the model.
+            audio (ndarray): PCM audio samples from the model.
         """
         logger.debug("Audio received from the model, sending to ACS client")
         await self.command.ws.send(
@@ -216,7 +238,7 @@ class Invoker:
         """Inward model-generated audio to AzureOpenAI via WebSocket.
 
         Args:
-            client: A realtime sk client that implements the integration.
+            client (RealtimeClientBase): A realtime sk client that implements the integration.
         """
         try:
             data = await self.command.ws.receive()
@@ -231,3 +253,10 @@ class Invoker:
                     )
         except Exception:
             logger.info("Websocket connection closed.")
+
+
+__all__ = [
+    "AOAITranslationClient",
+    "TranslateCommand",
+    "Invoker",
+]

@@ -1,78 +1,66 @@
 """
-Real-time Translation API
--------------------------
-Lightweight FastAPI application providing real-time translation services using 
-Azure OpenAI's Realtime API. The application supports audio streaming, text 
-messages, and session management.
+Main entry point for the Orchestrator real-time translation backend.
 
-Key endpoints:
-- POST /chat/start  → Create session and get session_id
-- POST /chat/message → Send text for translation
-- WS /ws/audio → Stream audio with control messages
-- POST /chat/stop → Close session and free resources
+This FastAPI app provides endpoints for real-time audio and text translation using Azure OpenAI, Azure Communication Services, and Event Grid. It manages user sessions, WebSocket audio streaming, and ACS call automation events, and coordinates translation using the Command and Observer patterns.
 
-Uses Azure OpenAI Realtime API for efficient streaming translation with minimal latency.
+Attributes:
+    app (FastAPI): The FastAPI application instance.
+    room_user_observer (RoomUserObserver): The main observer for user/room/call state.
+
 """
 
 import os
 import time
-import uuid
+import base64
 import asyncio
 import psutil
-from urllib.parse import urlparse, urlunparse, urlencode
-
-from starlette.middleware.cors import CORSMiddleware
-from fastapi import FastAPI, Request, WebSocket
+import json
+from fastapi import FastAPI, Request, WebSocket, Header, Depends
 from fastapi.security import OAuth2PasswordBearer
 from fastapi_mcp import FastApiMCP
+from fastapi.responses import JSONResponse
+from starlette.middleware.cors import CORSMiddleware
 
 from orchestrator import __app__, __author__, __version__, logger
-from orchestrator.schemas import SuccessMessage, ErrorMessage
+from orchestrator.schemas import SuccessMessage
 from orchestrator.background import lifespan
 from orchestrator.engine import TranslateCommand, Invoker
-
+from orchestrator.engine.observer import RoomUserObserver, LoggingObserver
+from orchestrator.utils import generate_user_id, sessions, user_sessions, session_users, track_ids
+from orchestrator.auth import validate_token
+from orchestrator.schemas.endpoints import ChatPayload
 
 tags_metadata: list[dict] = [
     {
-        "name": "Inference",
-        "description": """
-        Use agents to process multi-modal data for RAG.
-        """,
+        "name": "Real-Time Translation",
+        "description": "Endpoints for real-time audio and text translation using Azure OpenAI, Azure Communication Services (ACS), and Event Grid. Includes WebSocket streaming, session management, and translation orchestration.",
     },
     {
-        "name": "CRUD - Assemblies",
-        "description": "CRUD endpoints for Assembly model.",
+        "name": "Sessions",
+        "description": "Session and user management for translation and communication rooms.",
     },
     {
-        "name": "CRUD - Tools",
-        "description": "CRUD endpoints for Tool model.",
+        "name": "Health",
+        "description": "Health check and monitoring endpoints for the orchestrator backend.",
     },
     {
-        "name": "CRUD - TextData",
-        "description": "CRUD endpoints for TextData model.",
-    },
-    {
-        "name": "CRUD - ImageData",
-        "description": "CRUD endpoints for ImageData model.",
-    },
-    {
-        "name": "CRUD - AudioData",
-        "description": "CRUD endpoints for AudioData model.",
-    },
-    {
-        "name": "CRUD - VideoData",
-        "description": "CRUD endpoints for VideoData model.",
+        "name": "Admin",
+        "description": "Administrative and utility endpoints for orchestration and diagnostics.",
     },
 ]
 
 description: str = """
-    .
-"""
+Azure Real-Time Translation Orchestrator
 
-# Session management
-user_sessions: dict[str, str] = {}
-session_users: dict[str, str] = {}
-track_ids: dict[str, str] = {}
+A robust FastAPI backend for real-time, low-latency audio and text translation using Azure OpenAI (gpt-4o-realtime), Azure Communication Services (ACS), and Event Grid. Features include:
+- Real-time WebSocket endpoints for streaming audio and translation events
+- Session and user management for multi-user rooms
+- Integration with ACS for call automation and media streaming
+- Event-driven architecture with clear separation of concerns
+- Extensible, type-safe, and production-ready codebase
+
+Follows Azure best practices for security, scalability, and maintainability.
+"""
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 app = FastAPI(lifespan=lifespan, title=__app__, version=__version__)
@@ -87,11 +75,24 @@ app.add_middleware(
 
 mcp = FastApiMCP(app)
 
+# Initialize the observer and attach a logging observer (or your custom event observer)
+room_user_observer = RoomUserObserver()
+room_user_observer.attach(LoggingObserver())
+
 
 @app.get("/")
 async def health_check(request: Request):
-    """Azure-recommended health check endpoint with detailed metrics"""
-    logger.info("Health check endpoint called from %s", request.client.host)
+    """Health check endpoint with Azure-recommended metrics.
+
+    Args:
+        request (Request): The incoming HTTP request.
+
+    Returns:
+        SuccessMessage: Health and status metrics for the app.
+    """
+    # Fix: request.client may be None
+    client_host = request.client.host if request.client else "unknown"
+    logger.info("Health check endpoint called from %s", client_host)
     memory_usage = psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024
     
     return SuccessMessage(
@@ -107,114 +108,96 @@ async def health_check(request: Request):
 
 @app.websocket("/ws")
 async def ws(websocket: WebSocket):
-    # pick your command based on language or other context
+    await websocket.accept()
+    logger.info("Client connected to WebSocket")
+
     command = TranslateCommand(websocket)
+    command.configure(entry_language="en", exit_language="zh")  # TODO: Make dynamic if needed
     invoker = Invoker(command, create_response=True)
 
-    logger.info("Client connected to WebSocket")
     async with invoker as cmd:
-        receive_task = asyncio.create_task(invoker._handle_realtime_messages(client_ws))
-        await invoker._from_acs_to_realtime(client_ws)
-        receive_task.cancel()
+        async def from_acs_to_model():
+            while True:
+                try:
+                    data = await websocket.receive_text()
+                    msg = json.loads(data)
+                    if msg.get("kind") == "AudioData":
+                        audio_b64 = msg["audioData"]["data"]
+                        await command.send_audio_from_acs(audio_b64, msg["audioData"])
+                except Exception as e:
+                    logger.info(f"WebSocket receive closed: {e}")
+                    break
 
+        async def from_model_to_acs():
+            async for event in command.receive_events():
+                # Robustly handle audio events (send as binary)
+                try:
+                    # Support both dict and object attribute access
+                    kind = getattr(event, 'kind', None) if not isinstance(event, dict) else event.get('kind')
+                    audio_data = None
+                    if kind == "AudioData":
+                        audio_data_obj = getattr(event, 'audioData', None) if not isinstance(event, dict) else event.get('audioData')
+                        if audio_data_obj:
+                            audio_b64 = getattr(audio_data_obj, 'data', None) if not isinstance(audio_data_obj, dict) else audio_data_obj.get('data')
+                            if audio_b64:
+                                audio_bytes = base64.b64decode(audio_b64)
+                                await websocket.send_bytes(audio_bytes)
+                                continue
+                    try:
+                        await websocket.send_text(json.dumps(event))
+                    except TypeError:
+                        await websocket.send_text(str(event))
+                except Exception as e:
+                    logger.warning(f"Error processing model event for websocket: {e}")
+
+        task_recv = asyncio.create_task(from_acs_to_model())
+        task_send = asyncio.create_task(from_model_to_acs())
+        done, pending = await asyncio.wait([task_recv, task_send], return_when=asyncio.FIRST_COMPLETED)
+        for task in pending:
+            task.cancel()
+    await websocket.close()
 
 @app.post("/incoming-call")
 async def incoming_call_handler(request: Request):
+    """Handle incoming ACS call events from Event Grid.
 
+    Args:
+        request (Request): The incoming HTTP request with Event Grid payload.
+
+    Returns:
+        SuccessMessage: Result of call handling or subscription validation.
+    """
     data = await request.json()
-    async for event_dict in data:
-        event = EventGridEvent.from_dict(event_dict)
-        match event.event_type:
-            case SystemEventNames.EventGridSubscriptionValidationEventName:
-                logger.info("Validating subscription")
-                validation_code = event.data["validationCode"]
-                validation_response = {"validationResponse": validation_code}
-                return SuccessMessage(title="", message="", content=validation_response)
-            case SystemEventNames.AcsIncomingCallEventName:
-                logger.debug("Incoming call received: data=%s", event.data)
-                caller_id = (
-                    event.data["from"]["phoneNumber"]["value"]
-                    if event.data["from"]["kind"] == "phoneNumber"
-                    else event.data["from"]["rawId"]
-                )
-                logger.info("incoming call handler caller id: %s", caller_id)
-                incoming_call_context = event.data["incomingCallContext"]
-                guid = uuid.uuid4()
-                query_parameters = urlencode({"callerId": caller_id})
-                callback_uri = f"{CALLBACK_EVENTS_URI}/{guid}?{query_parameters}"
-
-                parsed_url = urlparse(CALLBACK_EVENTS_URI)
-                websocket_url = urlunparse(("wss", parsed_url.netloc, "/ws", "", "", ""))
-
-                logger.debug("callback url: %s", callback_uri)
-                logger.debug("websocket url: %s", websocket_url)
-
-                answer_call_result = await acs_client.answer_call(
-                    incoming_call_context=incoming_call_context,
-                    operation_context="incomingCall",
-                    callback_url=callback_uri,
-                    media_streaming=MediaStreamingOptions(
-                        transport_url=websocket_url,
-                        transport_type=MediaStreamingTransportType.WEBSOCKET,
-                        content_type=MediaStreamingContentType.AUDIO,
-                        audio_channel_type=MediaStreamingAudioChannelType.MIXED,
-                        start_media_streaming=True,
-                        enable_bidirectional=True,
-                        audio_format=AudioFormat.PCM24_K_MONO,
-                    ),
-                )
-                logger.info(f"Answered call for connection id: {answer_call_result.call_connection_id}")
-            case _:
-                logger.debug("Event type not handled: %s", event.event_type)
-                logger.debug("Event data: %s", event.data)
-        return SuccessMessage(
-            title="Incoming call handler",
-            message="Incoming call event processed successfully"
-        )
+    for event_dict in data:
+        result = await room_user_observer.handle_incoming_call(event_dict)
+        # Map call_connection_id to session_id if available
+        if result and "call_connection_id" in result:
+            # Try to extract session_id from the event or context if possible
+            # Here, we assume the callerId or guid can be mapped to a session_id (customize as needed)
+            session_id = result.get("guid") or result.get("session_id")
+            call_connection_id = result["call_connection_id"]
+            if session_id:
+                room_user_observer.map_connection_to_session(call_connection_id, session_id)
+        if result and "validationResponse" in result:
+            return SuccessMessage(title="", message="", content={"validationResponse": result["validationResponse"]})
     return SuccessMessage(
         title="Incoming call handler",
         message="Incoming call event processed successfully"
     )
 
-
-@app.post("/api/callbacks/<contextId>")
+@app.post("/api/callbacks/{contextId}")
 async def callbacks(request: Request):
+    """Handle ACS callback events (CallConnected, MediaStreamingStarted, etc).
+
+    Args:
+        request (Request): The incoming HTTP request with callback events.
+
+    Returns:
+        SuccessMessage: Result of callback event handling.
+    """
     data = await request.json()
     for event in data:
-        # Parsing callback events
-        global call_connection_id
-        event_data = event["data"]
-        call_connection_id = event_data["callConnectionId"]
-        logger.debug(
-            f"Received Event:-> {event['type']}, Correlation Id:-> {event_data['correlationId']}, CallConnectionId:-> {call_connection_id}"  # noqa: E501
-        )
-        match event["type"]:
-            case "Microsoft.Communication.CallConnected":
-                call_connection_properties = await acs_client.get_call_connection(
-                    call_connection_id
-                ).get_call_properties()
-                media_streaming_subscription = call_connection_properties.media_streaming_subscription
-                logger.info(f"MediaStreamingSubscription:--> {media_streaming_subscription}")
-                logger.info(f"Received CallConnected event for connection id: {call_connection_id}")
-                logger.debug("CORRELATION ID:--> %s", event_data["correlationId"])
-                logger.debug("CALL CONNECTION ID:--> %s", event_data["callConnectionId"])
-            case "Microsoft.Communication.MediaStreamingStarted" | "Microsoft.Communication.MediaStreamingStopped":
-                logger.debug(
-                    f"Media streaming content type:--> {event_data['mediaStreamingUpdate']['contentType']}"
-                )
-                logger.debug(
-                    f"Media streaming status:--> {event_data['mediaStreamingUpdate']['mediaStreamingStatus']}"
-                )
-                logger.debug(
-                    f"Media streaming status details:--> {event_data['mediaStreamingUpdate']['mediaStreamingStatusDetails']}"  # noqa: E501
-                )
-            case "Microsoft.Communication.MediaStreamingFailed":
-                logger.warning(
-                    f"Code:->{event_data['resultInformation']['code']}, Subcode:-> {event_data['resultInformation']['subCode']}"  # noqa: E501
-                )
-                logger.warning(f"Message:->{event_data['resultInformation']['message']}")
-            case "Microsoft.Communication.CallDisconnected":
-                logger.debug(f"Call disconnected for connection id: {call_connection_id}")
+        await room_user_observer.handle_callback_event(event)
     return SuccessMessage(
         title="Incoming call handler",
         message="Incoming call event processed successfully"

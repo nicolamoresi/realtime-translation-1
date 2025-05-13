@@ -41,18 +41,15 @@ def create_token(user_id: str, additional_data: Optional[Dict[str, Any]] = None)
     
     # Create the token payload
     payload = {
-        "sub": user_id,  # Subject (user identifier)
-        "iat": now,      # Issued at time
-        "exp": expire,   # Expiration time
+        "sub": user_id,
+        "iat": now,
+        "exp": expire
     }
-    
-    # Add any additional data
+
     if additional_data:
         payload.update(additional_data)
     
-    # Encode the token
     try:
-        # Use jose's jwt.encode method
         token = jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
         return token
     except Exception as e:
@@ -78,21 +75,17 @@ def validate_token(token: str) -> str:
         raise AuthError("Missing authentication token")
     
     try:
-        # For demo room, allow a simplified token
         if token == "demo" or (len(token) < 50 and "demo" in token):
             logger.info("Using demo token")
             return "demo_user"
             
-        # Decode and validate the token using jose
         payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
         
-        # Extract user_id from subject claim
         user_id = payload.get("sub")
         if not user_id:
             logger.warning("Token missing subject claim")
             raise AuthError("Invalid token: missing user identifier")
             
-        # Check if token is expired
         exp = payload.get("exp")
         if exp and int(time.time()) > exp:
             logger.warning(f"Expired token for user {user_id}")
@@ -101,7 +94,7 @@ def validate_token(token: str) -> str:
         logger.debug(f"Token validated for user {user_id}")
         return user_id
         
-    except JWTError as e:  # Use jose's JWTError instead of jwt.InvalidTokenError
+    except JWTError as e:
         logger.warning(f"Invalid token: {e}")
         raise AuthError(f"Invalid token: {str(e)}")
         

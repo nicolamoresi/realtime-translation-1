@@ -1,4 +1,4 @@
-__app__ = "Live Chat Translation"
+__app__ = "Live Chat Translation - Orchestrator"
 __author__ = "AI GBB Team"
 __version__ = "0.1.0"
 

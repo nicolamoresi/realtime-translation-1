@@ -16,7 +16,8 @@ Classes:
     JobResponse: Represents the response from a processing job.
 """
 
-from typing import Callable, List, Literal, Optional, Any
+from typing import Callable, List, Literal, Optional, Any, Dict
+from datetime import datetime
 from pydantic import BaseModel, Field, field_validator
 
 
@@ -101,4 +102,28 @@ class Tool(BaseModel):
     name: str = Field(..., description="Tool Name")
     description: str = Field(..., description="Tool Description")
     func: Callable[..., Any] = Field(..., description="Tool Function")
+
+
+class RoomRole(str):
+    """Roles as defined by Azure Communication Rooms SDK."""
+    PRESENTER = "Presenter"
+    ATTENDEE = "Attendee"
+    CONSUMER = "Consumer"
+
+
+class RoomParticipant(BaseModel):
+    """Represents a participant in an Azure Communication Room."""
+    id: str = Field(..., description="Azure Communication User ID")
+    role: RoomRole = Field(..., description="Role in the room")
+    join_time: Optional[datetime] = Field(None, description="Time the participant joined")
+
+
+class RoomModel(BaseModel):
+    """Represents an Azure Communication Room."""
+    room_id: str = Field(..., description="Room ID")
+    valid_from: datetime = Field(..., description="Room validity start time")
+    valid_until: datetime = Field(..., description="Room validity end time")
+    participants: Optional[List[RoomParticipant]] = Field(default_factory=list, description="Participants in the room")
+    created_at: Optional[datetime] = Field(None, description="Room creation time")
+    updated_at: Optional[datetime] = Field(None, description="Room last update time")
 

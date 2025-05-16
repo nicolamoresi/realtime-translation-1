@@ -15,20 +15,19 @@ import base64
 import asyncio
 import psutil
 import json
-from fastapi import FastAPI, Request, WebSocket, Header, Depends
+from fastapi import FastAPI, Request, WebSocket, APIRouter
 from fastapi.security import OAuth2PasswordBearer
 from fastapi_mcp import FastApiMCP
-from fastapi.responses import JSONResponse
 from starlette.middleware.cors import CORSMiddleware
 
 from orchestrator import __app__, __author__, __version__, logger
 from orchestrator.schemas import SuccessMessage
+from orchestrator.schemas.endpoints import UserRoomLanguageRequest, UserRoomLanguageResponse
 from orchestrator.background import lifespan
 from orchestrator.engine import TranslateCommand, Invoker
 from orchestrator.engine.observer import RoomUserObserver, LoggingObserver
-from orchestrator.utils import generate_user_id, sessions, user_sessions, session_users, track_ids
-from orchestrator.auth import validate_token
-from orchestrator.schemas.endpoints import ChatPayload
+from orchestrator.utils import session_users
+
 
 tags_metadata: list[dict] = [
     {
@@ -157,6 +156,7 @@ async def ws(websocket: WebSocket):
             task.cancel()
     await websocket.close()
 
+
 @app.post("/incoming-call")
 async def incoming_call_handler(request: Request):
     """Handle incoming ACS call events from Event Grid.
@@ -170,10 +170,7 @@ async def incoming_call_handler(request: Request):
     data = await request.json()
     for event_dict in data:
         result = await room_user_observer.handle_incoming_call(event_dict)
-        # Map call_connection_id to session_id if available
         if result and "call_connection_id" in result:
-            # Try to extract session_id from the event or context if possible
-            # Here, we assume the callerId or guid can be mapped to a session_id (customize as needed)
             session_id = result.get("guid") or result.get("session_id")
             call_connection_id = result["call_connection_id"]
             if session_id:
@@ -203,5 +200,31 @@ async def callbacks(request: Request):
         message="Incoming call event processed successfully"
     )
 
+router = APIRouter()
+
+@router.post("/api/room/user-language", response_model=UserRoomLanguageResponse)
+async def user_room_language_endpoint(request: UserRoomLanguageRequest):
+    """Endpoint to inform the backend of the user, room, and preferred language when joining a room."""
+    bot_id = "interpreter-bot"  # This should be a unique, known ID for the bot
+    bot_info = {
+        "acs_id": bot_id,
+        "display_name": "Interpreter",
+        "role": "Bot",
+        "language": request.language  # Use the user's language as the bot's source language
+    }
+    room_user_observer.join_room(bot_id, request.room_id, bot_info)
+    if hasattr(room_user_observer, "join_bot_to_acs_call"):
+        room_user_observer.join_bot_to_acs_call(request.room_id, bot_info)
+    else:
+        # Fallback: If not implemented, log or pass
+        logger.info(f"Bot join to ACS call for room {request.room_id} would be triggered here.")
+    return UserRoomLanguageResponse(
+        user_id=request.user_id,
+        room_id=request.room_id,
+        language=request.language,
+        bot_display_name="Interpreter"
+    )
+
+app.include_router(router)
 
 mcp.mount()

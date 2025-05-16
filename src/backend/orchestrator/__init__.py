@@ -2,9 +2,12 @@ __app__ = "Live Chat Translation - Orchestrator"
 __author__ = "AI GBB Team"
 __version__ = "0.1.0"
 
+import os
 import logging
 import sys
 from logging.handlers import RotatingFileHandler
+
+from dotenv import load_dotenv
 
 
 def setup_logging():
@@ -33,6 +36,8 @@ def setup_logging():
     
     return logger
 
-
 logger = setup_logging()
 logger.info(f"{__app__} - {__author__} - Version: {__version__} initialized")
+
+env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '.env')
+load_dotenv(dotenv_path=env_path)

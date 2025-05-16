@@ -1,4 +1,5 @@
-export const API_BASE = process.env.NEXT_PUBLIC_API_BASE || 'http://localhost:8000'
+export const API_BASE = process.env.NEXT_PUBLIC_API_BASE || 'http://localhost:8082'
+export const ORCHESTRATOR = process.env.NEXT_PUBLIC_API_BASE || 'http://localhost:8081'
 
 // Authentication functions - keep existing ones
 
@@ -168,17 +169,36 @@ export interface RoomParticipant {
 }
 
 // Create a new room
-export async function createRoom(validForMinutes = 60, participants: RoomParticipant[] = []) {
-  const res = await fetch(`${API_BASE}/rooms`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ valid_for_minutes: validForMinutes, participants })
-  })
-  if (!res.ok) {
-    const error = await res.json().catch(() => ({}))
-    throw new Error(error.detail || 'Failed to create room')
+// Only pass participants with valid ACS IDs (created via /acs/users)
+export async function createRoom(validForMinutes: number, participants: Array<{ id: string; role: string }>) {
+  // Optionally, validate ACS ID format here as well
+  const acsIdRegex = /^8:[a-z]+:[\w-]+$/;
+  for (const p of participants) {
+    if (!acsIdRegex.test(p.id)) {
+      throw new Error(`Invalid ACS ID: ${p.id}. Use /acs/users to create valid ACS users.`);
+    }
   }
-  return res.json()
+  try {
+    const response = await fetch(`${API_BASE}/rooms`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        valid_for_minutes: validForMinutes,
+        participants,
+      }),
+    });
+
+    if (!response.ok) {
+      throw new Error(`Failed to create room: ${response.statusText}`);
+    }
+
+    return await response.json(); // Returns the created room details
+  } catch (error) {
+    console.error('Error creating room:', error);
+    throw error;
+  }
 }
 
 // Get room details

@@ -1,72 +1,129 @@
-'use client'
+'use client';
 
-import { useEffect, useState } from 'react'
-import { useParams } from 'next/navigation'
-import { CallComposite, createAzureCommunicationCallAdapter } from '@azure/communication-react'
-import type { CallAdapter } from '@azure/communication-react'
-import { Spinner } from '@fluentui/react-components'
-import { API_BASE, getRoomToken } from '@/utils/api'
-import { CommunicationTokenCredential, CommunicationGetTokenOptions } from '@azure/communication-common'
-import type { AccessToken } from '@azure/core-auth'
+import dynamic from 'next/dynamic';
+import { useParams } from 'next/navigation';
+import { useEffect, useState, useCallback } from 'react';
+import { API_BASE, ORCHESTRATOR } from '@/utils/api';
+import React from 'react';
 
-// Custom CommunicationTokenCredential implementation
-class CustomCommunicationTokenCredential implements CommunicationTokenCredential {
-  private token: string;
-  constructor(token: string) {
-    this.token = token;
-  }
-  async getToken(_options?: CommunicationGetTokenOptions): Promise<AccessToken> {
-    return {
-      token: this.token,
-      expiresOnTimestamp: Date.now() + 60 * 60 * 1000
-    }
-  }
-  dispose(): void {
-    // No-op for this simple implementation
-  }
-}
+const LANGUAGE_OPTIONS = [
+  { value: 'en', label: 'English' },
+  { value: 'es', label: 'Spanish' },
+  { value: 'fr', label: 'French' },
+  { value: 'de', label: 'German' },
+  { value: 'pt', label: 'Portuguese' },
+  { value: 'ch', label: 'Chinese' },
+  { value: 'jp', label: 'Japanese' },
+  { value: 'cr', label: 'Corean' },
+  // Add more as needed
+];
+
+const CallCompositeWrapper = dynamic(() => import('../../../components/CallCompositeWrapper'), { ssr: false });
 
 export default function RoomPage() {
-  const { roomId } = useParams<{ roomId: string }>()
-  const [adapter, setAdapter] = useState<CallAdapter | null>(null)
-  const [error, setError] = useState<string | null>(null)
+  const { roomId } = useParams<{ roomId: string }>();
+  console.log('[RoomPage] MOUNT', { roomId });
+  const [acsCredentials, setAcsCredentials] = useState<null | { user_id: string; token: string; expires_on: number }>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [selectedLanguage, setSelectedLanguage] = useState<string>('en');
+  const [languageConfirmed, setLanguageConfirmed] = useState<boolean>(false);
 
   useEffect(() => {
-    let disposed = false;
-    async function setupAdapter() {
-      try {
-        // Use the new API wrapper for room token
-        const { token, userId } = await getRoomToken(roomId)
-        const credential = new CustomCommunicationTokenCredential(token)
-        const adapter = await createAzureCommunicationCallAdapter({
-          userId,
-          displayName: 'User', // You may want to set this dynamically
-          credential,
-          locator: { groupId: roomId }
-        })
-        if (!disposed) setAdapter(adapter)
-      } catch (e: unknown) {
-        setError(e instanceof Error ? e.message : 'Failed to initialize room')
-      }
+    if (!roomId || !languageConfirmed) {
+      // Wait for language selection before fetching token
+      return;
     }
-    setupAdapter()
-    return () => {
-      disposed = true
-      if (adapter && adapter.dispose) adapter.dispose()
-    }
-    // eslint-disable-next-line
-  }, [roomId])
 
-  if (error) {
-    return <div className="p-6 text-red-600">{error}</div>
-  }
-  if (!adapter) {
-    return <div className="flex justify-center items-center h-full"><Spinner label="Joining room..." /></div>
-  }
+    let isMounted = true;
+
+    const fetchAcsTokenAndNotifyBot = async () => {
+      try {
+        // 1. Fetch ACS token
+        console.log('[RoomPage] Fetching ACS token for roomId:', roomId);
+        const res = await fetch(`${API_BASE}/rooms/${roomId}/token`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ language: selectedLanguage }),
+        });
+        const text = await res.text();
+        console.log('[RoomPage] Token fetch response:', res.status, res.statusText, '| Body:', text);
+        if (!res.ok) throw new Error('Failed to get ACS token: ' + text);
+        const data = JSON.parse(text);
+        console.log('[RoomPage] ACS credentials data:', data);
+        if (isMounted) {
+          setAcsCredentials(data);
+        }
+        // 2. Notify backend of user/room/language and trigger bot join
+        if (data && data.user_id) {
+          await fetch(`${ORCHESTRATOR}/api/room/user-language`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              user_id: data.user_id,
+              room_id: roomId,
+              language: selectedLanguage,
+            }),
+          });
+        }
+      } catch (err: unknown) {
+        console.error('[RoomPage] Error fetching ACS token or notifying bot:', err);
+        setError(err instanceof Error ? err.message : 'Could not join room');
+      }
+    };
+    fetchAcsTokenAndNotifyBot();
+    return () => { isMounted = false; };
+  }, [roomId, languageConfirmed, selectedLanguage]);
+
+  const renderCallComposite = useCallback(() => {
+    if (!acsCredentials) {
+      console.log('[RoomPage] No ACS credentials, not rendering CallCompositeWrapper');
+      return null;
+    }
+    console.log('[RoomPage] Rendering CallCompositeWrapper with:', { roomId, acsCredentials });
+    return (
+      <CallCompositeWrapper
+        roomId={roomId as string}
+        acsUserId={acsCredentials.user_id}
+        acsToken={acsCredentials.token}
+      />
+    );
+  }, [roomId, acsCredentials]);
 
   return (
-    <div style={{ height: '100vh', width: '100vw' }}>
-      <CallComposite adapter={adapter} />
-    </div>
-  )
+    <section style={{ height: '100vh', width: '100vw' }}>
+      {!languageConfirmed && (
+        <div className="p-6 flex flex-col items-center justify-center h-full">
+          <div className="mb-4 text-lg font-semibold">Select your speaking language</div>
+          <select
+            className="mb-4 p-2 border rounded"
+            value={selectedLanguage}
+            onChange={e => setSelectedLanguage(e.target.value)}
+          >
+            {LANGUAGE_OPTIONS.map(opt => (
+              <option key={opt.value} value={opt.value}>{opt.label}</option>
+            ))}
+          </select>
+          <button
+            className="px-4 py-2 bg-blue-600 text-white rounded"
+            onClick={() => setLanguageConfirmed(true)}
+          >
+            Join Room
+          </button>
+        </div>
+      )}
+      {languageConfirmed && (
+        <>
+          {!roomId ? (
+            <div className="p-6 text-red-600">Room ID is missing</div>
+          ) : error ? (
+            <div className="p-6 text-red-600">{error}</div>
+          ) : acsCredentials ? (
+            renderCallComposite()
+          ) : (
+            <div className="p-6 text-blue-600">Joining room...</div>
+          )}
+        </>
+      )}
+    </section>
+  );
 }

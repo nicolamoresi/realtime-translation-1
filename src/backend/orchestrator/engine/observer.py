@@ -5,18 +5,19 @@ This module defines the Subject/Observer pattern for managing user/room/call sta
 """
 
 from abc import ABC, abstractmethod
-from random import randrange
 
 import asyncio
 import logging
 import os
 import uuid
-from urllib.parse import urlencode, urlparse, urlunparse
+import base64
 
-from azure.communication.callautomation.aio import CallAutomationClient
-from azure.communication.callautomation import MediaStreamingOptions
+from urllib.parse import urlencode, urlparse, urlunparse
+from typing import Dict, Set, Any, Optional
+
+from azure.communication.callautomation import CallAutomationClient, MediaStreamingOptions, CommunicationUserIdentifier
+from azure.communication.identity import CommunicationIdentityClient
 from azure.eventgrid import EventGridEvent, SystemEventNames
-from typing import Dict, List, Set, Any, Optional
 
 
 class Subject(ABC):
@@ -44,42 +45,6 @@ class Subject(ABC):
         pass
 
 
-class ConcreteSubject(Subject):
-    """Example subject implementation for demonstration purposes.
-
-    Attributes:
-        _state (Optional[int]): The state of the subject.
-        _observers (List[Observer]): List of observers subscribed to the subject.
-    """
-
-    _state: Optional[int] = None
-    _observers: List['Observer'] = []
-
-    def attach(self, observer: 'Observer') -> None:
-        """Attach an observer to the subject."""
-        print("Subject: Attached an observer.")
-        self._observers.append(observer)
-
-    def detach(self, observer: 'Observer') -> None:
-        """Detach an observer from the subject."""
-        self._observers.remove(observer)
-
-    def notify(self, event: 'RoomUserEvent') -> None:
-        """Notify all observers about an event."""
-        print("Subject: Notifying observers...")
-        for observer in self._observers:
-            observer.update(self, event)
-
-    def some_business_logic(self) -> None:
-        """Perform business logic and notify observers of state changes."""
-        print("\nSubject: I'm doing something important.")
-        self._state = randrange(0, 10)
-
-        print(f"Subject: My state has just changed to: {self._state}")
-        event = RoomUserEvent('state_change', data={'state': self._state})
-        self.notify(event)
-
-
 class Observer(ABC):
     """Abstract base class for observers in the Observer pattern.
 
@@ -91,23 +56,6 @@ class Observer(ABC):
     def update(self, subject: Subject, event: 'RoomUserEvent') -> None:
         """Receive update from subject."""
         pass
-
-
-class ConcreteObserverA(Observer):
-    """Concrete observer implementation that reacts to specific events."""
-
-    def update(self, subject: Subject, event: 'RoomUserEvent') -> None:
-        if event.data.get('state', 0) < 3:
-            print("ConcreteObserverA: Reacted to the event")
-
-
-class ConcreteObserverB(Observer):
-    """Concrete observer implementation that reacts to specific events."""
-
-    def update(self, subject: Subject, event: 'RoomUserEvent') -> None:
-        state = event.data.get('state', 0)
-        if state == 0 or state >= 2:
-            print("ConcreteObserverB: Reacted to the event")
 
 
 class RoomUserEvent:
@@ -151,8 +99,9 @@ class RoomUserObserver(Subject):
         self._call_connections: Dict[str, dict] = {}
         self._session_websockets: Dict[str, Any] = {}
         self._connection_session: Dict[str, str] = {}
-        acs_conn_str = os.environ.get("AZURE_COMMUNICATION_CONNECTION_STRING")
-        self.acs_client = CallAutomationClient.from_connection_string(acs_conn_str) if acs_conn_str else None
+        acs_conn_str = os.environ.get("ACS_CONNECTION_STRING", "")
+        self.acs_client = CallAutomationClient.from_connection_string(acs_conn_str)
+        self.identity_client = CommunicationIdentityClient.from_connection_string(acs_conn_str)
 
     def attach(self, observer: 'Observer') -> None:
         """Attach an observer to the subject."""
@@ -211,7 +160,7 @@ class RoomUserObserver(Subject):
         return self._user_info.get(user_id)
 
     def register_websocket(self, session_id: str, websocket: Any):
-        """Register a WebSocket for a session."""
+        """Register a WebSocket for a session.""" 
         self._session_websockets[session_id] = websocket
 
     def unregister_websocket(self, session_id: str):
@@ -268,7 +217,7 @@ class RoomUserObserver(Subject):
                 enable_bidirectional=True,
                 audio_format="pcm16_24khz_mono"
             )  #type: ignore
-            answer_call_result = await self.acs_client.answer_call(
+            answer_call_result = self.acs_client.answer_call(
                 incoming_call_context=incoming_call_context,
                 operation_context="incomingCall",
                 callback_url=callback_uri,
@@ -322,12 +271,25 @@ class RoomUserObserver(Subject):
         if self.acs_client and call_connection_id:
             try:
                 call_connection = self.acs_client.get_call_connection(call_connection_id)
-                call_properties = await call_connection.get_call_properties()
+                call_properties = call_connection.get_call_properties()
                 media_streaming_subscription = getattr(call_properties, "media_streaming_subscription", None)
                 self._call_connections[call_connection_id] = {
                     **event_data,
                     "media_streaming_subscription": media_streaming_subscription,
                 }
+                # Add bot as participant if bot info is available for this call/room
+                bot_info = self._call_connections.get(event_data.get('roomId') or event_data.get('room_id'))
+                if bot_info and bot_info.get('bot_identifier'):
+                    logging.info(
+                        "Adding bot '%s' as participant to ACS call (call_connection_id=%s)",
+                        bot_info.get('bot_display_name', 'Bot'),
+                        call_connection_id
+                    )
+                    try:
+                        add_result = call_connection.add_participant(target_participant=bot_info['bot_identifier'])
+                        logging.info(f"Bot add_participant result: {add_result}")
+                    except Exception as e:
+                        logging.error(f"Failed to add bot as participant: {e}")
                 from orchestrator.engine.client import TranslateCommand, Invoker
                 ws = self.get_websocket_for_connection(call_connection_id)
                 if ws:
@@ -357,6 +319,59 @@ class RoomUserObserver(Subject):
         """Start translation session using the provided invoker."""
         async with invoker as cmd:
             await asyncio.sleep(0)
+
+    async def handle_incoming_audio(self, user_id: str, room_id: str, audio_b64: str, meta: dict):
+        """
+        Handle incoming audio from a user, interpret it with the client module, and distribute the result.
+        Args:
+            user_id (str): The user sending the audio.
+            room_id (str): The room the user is in.
+            audio_b64 (str): The base64-encoded audio data.
+            meta (dict): Additional metadata (e.g., language, timestamp).
+        """
+        call_connection_id = str(meta.get('call_connection_id', ''))
+        if not call_connection_id:
+            logging.warning(f"No call_connection_id provided in meta for user {user_id} in room {room_id}")
+            return
+        ws = self.get_websocket_for_connection(call_connection_id)
+        if not ws:
+            logging.warning(f"No websocket found for user {user_id} in room {room_id}")
+            return
+        from orchestrator.engine.client import TranslateCommand, Invoker
+        command = TranslateCommand(ws)
+        # Use user's preferred language from meta or default
+        entry_language = meta.get('language', 'en')
+        exit_language = meta.get('target_language', 'zh')
+        command.configure(entry_language=entry_language, exit_language=exit_language)
+        invoker = Invoker(command, create_response=True)
+
+        audio_bytes = base64.b64decode(audio_b64)
+        async with invoker as cmd:
+            await command.send_audio_from_acs(audio_bytes, meta)
+            # Optionally, handle the response/streaming events here
+
+    def join_bot_to_acs_call(self, room_id: str, bot_info: dict):
+        """
+        Prepare the bot to join the ACS call for the given room. The bot will be added as a participant after the call is established (in _handle_call_connected).
+        """
+        if not self.acs_client:
+            logging.error("ACS client not initialized. Cannot join bot to ACS call.")
+            raise RuntimeError("ACS client not initialized. Set AZURE_COMMUNICATION_CONNECTION_STRING.")
+
+        # Always create a new ACS user for the bot (stateless, safe for demo)
+        bot_user = self.identity_client.create_user()
+        bot_identifier = CommunicationUserIdentifier(bot_user.properties['id'])
+
+        # Store bot info for later use in _handle_call_connected
+        self._call_connections[room_id] = {
+            "bot_identifier": bot_identifier,
+            "bot_display_name": bot_info.get('display_name', 'Bot'),
+            "room_id": room_id
+        }
+        logging.info(f"Bot info stored for room {room_id}, will add after call is established.")
+
+        # Optionally, you may want to trigger the call connection here if not already done
+        # (If connect_call is needed, ensure it is only called once per room/call)
 
 
 class RoomUserEventObserver(Observer):

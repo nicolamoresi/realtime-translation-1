@@ -25,3 +25,16 @@ class JobResponse(BaseModel):
 
     assembly_id: str = Field(..., description="Assembly ID")
     prompt: str = Field(..., description="Job Status")
+
+
+class UserRoomLanguageRequest(BaseModel):
+    user_id: str = Field(..., description="User ID")
+    room_id: str = Field(..., description="Room ID")
+    language: str = Field(..., description="User's preferred speaking language")
+
+
+class UserRoomLanguageResponse(BaseModel):
+    user_id: str = Field(..., description="User ID")
+    room_id: str = Field(..., description="Room ID")
+    language: str = Field(..., description="User's preferred speaking language")
+    bot_display_name: str = Field(..., description="Display name for the interpreter bot")

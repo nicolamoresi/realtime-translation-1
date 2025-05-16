@@ -104,17 +104,10 @@ class Tool(BaseModel):
     func: Callable[..., Any] = Field(..., description="Tool Function")
 
 
-class RoomRole(str):
-    """Roles as defined by Azure Communication Rooms SDK."""
-    PRESENTER = "Presenter"
-    ATTENDEE = "Attendee"
-    CONSUMER = "Consumer"
-
-
 class RoomParticipant(BaseModel):
     """Represents a participant in an Azure Communication Room."""
     id: str = Field(..., description="Azure Communication User ID")
-    role: RoomRole = Field(..., description="Role in the room")
+    role: Literal["Presenter", "Attendee", "Consumer"] = Field(..., description="Role in the room")
     join_time: Optional[datetime] = Field(None, description="Time the participant joined")
 
 

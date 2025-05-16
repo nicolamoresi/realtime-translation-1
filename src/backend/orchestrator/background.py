@@ -11,6 +11,7 @@ try:
 except ImportError:
     sessions = {}  # Fallback for type checking; should not happen in production
 
+
 async def resource_cleanup_task():
     """Background task to clean up inactive sessions and free resources.
 

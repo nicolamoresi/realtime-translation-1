@@ -3,15 +3,33 @@
 import Link from 'next/link'
 import { useState } from 'react'
 import { useRouter } from 'next/navigation'
+import { createRoom, API_BASE } from '@/utils/api';
 
 export default function Home() {
   const [roomId, setRoomId] = useState('');
   const router = useRouter();
+  const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
-  const handleJoinRoom: React.FormEventHandler<HTMLFormElement> = (e: React.FormEvent<HTMLFormElement>) => {
+  const handleJoinRoom: React.FormEventHandler<HTMLFormElement> = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
+    setError(null);
+    setIsLoading(true);
     if (roomId.trim()) {
-      router.push(`/simulate/${roomId}?anonymous=true`);
+      try {
+        const res = await fetch(`${API_BASE}/acs/users`, { method: 'POST' });
+        if (!res.ok) throw new Error('Failed to create ACS user');
+        const { id: acsUserId } = await res.json();
+        const participants = [
+          { id: acsUserId, role: 'Presenter' }
+        ];
+        const room = await createRoom(60, participants);
+        router.push(`/room/${room.room_id}?anonymous=true`);
+      } catch (error: unknown) {
+        setError(error instanceof Error ? error.message : 'Failed to create or join room');
+      } finally {
+        setIsLoading(false);
+      }
     }
   };
 
@@ -39,10 +57,15 @@ export default function Home() {
           <button
             type="submit"
             className="w-full flex justify-center py-3 px-4 border border-transparent rounded-md shadow-sm text-white bg-blue-600 hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 transition duration-150"
+            disabled={isLoading}
           >
-            Join as Guest
+            {isLoading ? 'Joining...' : 'Join as Guest'}
           </button>
         </form>
+
+        {error && (
+          <div className="mt-4 text-red-600 text-center">{error}</div>
+        )}
         
         <div className="mt-8 grid grid-cols-2 gap-4">
           <Link href="/signup" className="block">
@@ -62,5 +85,5 @@ export default function Home() {
         </div>
       </div>
     </main>
-  )
+  );
 }

@@ -3,7 +3,7 @@
 import dynamic from 'next/dynamic';
 import { useParams } from 'next/navigation';
 import { useEffect, useState, useCallback } from 'react';
-import { API_BASE, ORCHESTRATOR } from '@/utils/api';
+import { API_BASE } from '@/utils/api';
 import React from 'react';
 
 const LANGUAGE_OPTIONS = [
@@ -52,18 +52,6 @@ export default function RoomPage() {
         console.log('[RoomPage] ACS credentials data:', data);
         if (isMounted) {
           setAcsCredentials(data);
-        }
-        // 2. Notify backend of user/room/language and trigger bot join
-        if (data && data.user_id) {
-          await fetch(`${ORCHESTRATOR}/api/room/user-language`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              user_id: data.user_id,
-              room_id: roomId,
-              language: selectedLanguage,
-            }),
-          });
         }
       } catch (err: unknown) {
         console.error('[RoomPage] Error fetching ACS token or notifying bot:', err);

@@ -1,23 +1,32 @@
 """
 Observer pattern and ACS event handling for real-time translation backend.
 
-This module defines the Subject/Observer pattern for managing user/room/call state, and integrates Azure Communication Services (ACS) event handling for call automation and media streaming. It also provides session and WebSocket mapping for real-time translation.
+This module defines the Subject/Observer pattern for managing user/room/call state, and integrates
+Azure Communication Services (ACS) event handling for call automation and media streaming.
+It also provides session and WebSocket mapping for real-time translation.
 """
 
 from abc import ABC, abstractmethod
 
-import asyncio
-import logging
 import os
 import uuid
-import base64
 
-from urllib.parse import urlencode, urlparse, urlunparse
+from urllib.parse import urlencode
 from typing import Dict, Set, Any, Optional
 
-from azure.communication.callautomation import CallAutomationClient, MediaStreamingOptions, CommunicationUserIdentifier
+from azure.communication.callautomation import CallAutomationClient, MediaStreamingOptions
+from azure.communication.rooms import RoomsClient, RoomParticipant, ParticipantRole
 from azure.communication.identity import CommunicationIdentityClient
 from azure.eventgrid import EventGridEvent, SystemEventNames
+
+from orchestrator.engine import Invoker
+from orchestrator.schemas.models import CallConnectionInfo
+from orchestrator import logger
+
+
+ENVIRONMENT = os.environ.get("ENVIRONMENT", "development")
+CALLBACK_URI = os.environ.get("CALLBACK_EVENTS_URI", "https://svd8j22b-9000.brs.devtunnels.ms/callbacks")
+WEBSOCKET_URI = os.environ.get('WEBSOCKET_EVENTS_URI', 'wss://svd8j22b-9000.brs.devtunnels.ms/ws')
 
 
 class Subject(ABC):
@@ -32,17 +41,14 @@ class Subject(ABC):
     @abstractmethod
     def attach(self, observer: 'Observer') -> None:
         """Attach an observer to the subject."""
-        pass
 
     @abstractmethod
     def detach(self, observer: 'Observer') -> None:
         """Detach an observer from the subject."""
-        pass
 
     @abstractmethod
     def notify(self, event: 'RoomUserEvent') -> None:
         """Notify all observers about an event."""
-        pass
 
 
 class Observer(ABC):
@@ -55,7 +61,6 @@ class Observer(ABC):
     @abstractmethod
     def update(self, subject: Subject, event: 'RoomUserEvent') -> None:
         """Receive update from subject."""
-        pass
 
 
 class RoomUserEvent:
@@ -78,16 +83,13 @@ class RoomUserEvent:
 class RoomUserObserver(Subject):
     """Observer subject for managing room/user state and ACS event handling.
 
-    Manages rooms, users, sessions, and call connection mappings. Handles ACS incoming call and callback events, and triggers translation using the Command pattern.
+    Manages rooms, users, sessions, and call connection mappings.
+    Handles ACS incoming call and callback events, and triggers translation using the Command pattern.
 
     Methods:
-        join_room(user_id, room_id, user_info): Register a user joining a room.
-        leave_room(user_id): Register a user leaving a room.
         handle_incoming_call(event_dict): Handle ACS incoming call events.
         handle_callback_event(event): Handle ACS callback events.
         register_websocket(session_id, websocket): Register a WebSocket for a session.
-        unregister_websocket(session_id): Remove a WebSocket mapping.
-        map_connection_to_session(call_connection_id, session_id): Map ACS call connection to session.
         get_websocket_for_connection(call_connection_id): Get WebSocket for a call connection.
     """
 
@@ -96,12 +98,13 @@ class RoomUserObserver(Subject):
         self._rooms: Dict[str, Set[str]] = {}
         self._user_room: Dict[str, str] = {}
         self._user_info: Dict[str, Dict[str, Any]] = {}
-        self._call_connections: Dict[str, dict] = {}
-        self._session_websockets: Dict[str, Any] = {}
+        self._call_connections: Dict[str, CallConnectionInfo] = {}
+        self._invokers: Dict[str, Invoker] = {}
         self._connection_session: Dict[str, str] = {}
         acs_conn_str = os.environ.get("ACS_CONNECTION_STRING", "")
         self.acs_client = CallAutomationClient.from_connection_string(acs_conn_str)
         self.identity_client = CommunicationIdentityClient.from_connection_string(acs_conn_str)
+        self.rooms_client = RoomsClient.from_connection_string(acs_conn_str)
 
     def attach(self, observer: 'Observer') -> None:
         """Attach an observer to the subject."""
@@ -122,72 +125,33 @@ class RoomUserObserver(Subject):
         for observer in self._observers:
             observer.update(self, event)
 
-    def join_room(self, user_id: str, room_id: str, user_info: Optional[dict] = None):
-        """Register a user joining a room."""
-        if room_id not in self._rooms:
-            self._rooms[room_id] = set()
-        self._rooms[room_id].add(user_id)
-        self._user_room[user_id] = room_id
-        if user_info:
-            self._user_info[user_id] = user_info
-        self.notify('user_joined', {'user_id': user_id, 'room_id': room_id, 'user_info': user_info})
-
-    def leave_room(self, user_id: str):
-        """Register a user leaving a room."""
-        room_id = self._user_room.get(user_id)
-        if room_id and user_id in self._rooms.get(room_id, set()):
-            self._rooms[room_id].remove(user_id)
-            if not self._rooms[room_id]:
-                del self._rooms[room_id]
-        self._user_room.pop(user_id, None)
-        self._user_info.pop(user_id, None)
-        self.notify('user_left', {'user_id': user_id, 'room_id': room_id})
-
-    def handle_call_event(self, event_type: str, data: dict):
-        """Handle call-related events (e.g., incoming, connected, disconnected)."""
-        self.notify(event_type, data)
-
-    def get_users_in_room(self, room_id: str) -> Set[str]:
-        """Get the list of users in a room."""
-        return self._rooms.get(room_id, set())
-
-    def get_room_of_user(self, user_id: str) -> Optional[str]:
-        """Get the room ID of a user."""
-        return self._user_room.get(user_id)
-
-    def get_user_info(self, user_id: str) -> Optional[dict]:
-        """Get the information of a user."""
-        return self._user_info.get(user_id)
-
-    def register_websocket(self, session_id: str, websocket: Any):
+    def register_invoker(self, session_id: str, invoker: Invoker):
         """Register a WebSocket for a session.""" 
-        self._session_websockets[session_id] = websocket
+        self._invokers[session_id] = invoker
 
-    def unregister_websocket(self, session_id: str):
+    def unregister_invoker(self, session_id: str):
         """Remove a WebSocket mapping for a session."""
-        self._session_websockets.pop(session_id, None)
+        self._invokers.pop(session_id, None)
 
     def map_connection_to_session(self, call_connection_id: str, session_id: str):
         """Associate a call connection ID with a session ID."""
         self._connection_session[call_connection_id] = session_id
 
-    def get_websocket_for_connection(self, call_connection_id: str):
+    def get_invoker_for_connection(self, call_connection_id: str):
         """Retrieve the WebSocket for a given call connection ID."""
-        session_id = self._connection_session.get(call_connection_id)
-        if session_id:
-            return self._session_websockets.get(session_id)
-        return None
+        return self._invokers.get(call_connection_id)
 
     async def handle_incoming_call(self, event_dict):
         """Handles EventGrid events for ACS incoming calls using the ACS SDK."""
         event = EventGridEvent.from_dict(event_dict)
-        if event.event_type == SystemEventNames.EventGridSubscriptionValidationEventName:
-            return self._handle_subscription_validation(event)
-        elif event.event_type == SystemEventNames.AcsIncomingCallEventName:
-            return await self._handle_acs_incoming_call(event)
-        else:
-            self.notify('incoming_call_unhandled', {"event": event_dict})
-            return None
+        match event.event_type:
+            case SystemEventNames.EventGridSubscriptionValidationEventName:
+                return self._handle_subscription_validation(event)
+            case 'Microsoft.Communication.CallStarted':
+                return await self._handle_acs_incoming_call(event)
+            case _:
+                self.notify('incoming_call_unhandled', {"event": event_dict})
+                return None
 
     def _handle_subscription_validation(self, event):
         """Handle EventGrid subscription validation event."""
@@ -196,57 +160,59 @@ class RoomUserObserver(Subject):
 
     async def _handle_acs_incoming_call(self, event):
         """Handle ACS incoming call event."""
-        caller_id = (
-            event.data["from"]["phoneNumber"]["value"]
-            if event.data["from"]["kind"] == "phoneNumber"
-            else event.data["from"]["rawId"]
-        )
-        incoming_call_context = event.data["incomingCallContext"]
+        caller_id = event.data["startedBy"]["communicationIdentifier"]["rawId"]
+        room_id = event.data["room"]["id"]
         guid = uuid.uuid4()
         callback_uri, websocket_url = self._build_callback_uris(caller_id, guid)
         if not self.acs_client:
             raise RuntimeError("ACS client not initialized. Set AZURE_COMMUNICATION_CONNECTION_STRING.")
         try:
-            # If your ACS resource or SDK requires a bot_id, add it here. Otherwise, omit it.
             media_streaming_options = MediaStreamingOptions(
                 transport_url=websocket_url,
-                transport_type="WebSocket",
+                transport_type="websocket",
                 content_type="audio",
                 audio_channel_type="mixed",
                 start_media_streaming=True,
                 enable_bidirectional=True,
-                audio_format="pcm16_24khz_mono"
+                audio_format="pcm16KMono"
             )  #type: ignore
-            answer_call_result = self.acs_client.answer_call(
-                incoming_call_context=incoming_call_context,
+            answer_call_result = self.acs_client.connect_call(
+                room_id=room_id,
                 operation_context="incomingCall",
                 callback_url=callback_uri,
                 media_streaming=media_streaming_options,
             )
+
         except Exception as e:
-            logging.error(f"Failed to answer ACS call: {e}")
-            raise
-        self._call_connections[str(guid)] = {
+            logger.error(f"Failed to answer ACS call: {e}")
+            raise RuntimeError(f"Failed to answer ACS call: {e}")
+
+        call_connection_id = answer_call_result.call_connection_id
+
+        if not call_connection_id:
+            logger.error("Failed to answer ACS call, no call_connection_id returned.")
+            raise RuntimeError("Failed to answer ACS call, no call_connection_id returned.")
+
+        bot_info = {"display_name": "Interpreter", "language": "en"}
+
+        self._call_connections[call_connection_id] = CallConnectionInfo(**{
             "caller_id": caller_id,
-            "context": incoming_call_context,
+            "room_id": room_id,
             "callback_uri": callback_uri,
             "websocket_url": websocket_url,
             "call_connection_id": answer_call_result.call_connection_id,
-        }
-        self.notify('incoming_call', {"caller_id": caller_id, "guid": str(guid), "call_connection_id": answer_call_result.call_connection_id})
-        return {
-            "callback_uri": callback_uri,
-            "websocket_url": websocket_url,
-            "guid": str(guid),
-            "call_connection_id": answer_call_result.call_connection_id,
-        }
+            "bot_display_name": bot_info["display_name"],
+            "bot_language": bot_info["language"]
+        })
+
+        self.notify('incoming_call', self._call_connections[call_connection_id].model_dump())
+        return self._call_connections[call_connection_id]
 
     def _build_callback_uris(self, caller_id, guid):
         """Build callback and websocket URIs for ACS call answer."""
         query_parameters = urlencode({"callerId": caller_id})
-        callback_uri = f"{os.environ.get('CALLBACK_EVENTS_URI')}/{guid}?{query_parameters}"
-        parsed_url = urlparse(os.environ.get('CALLBACK_EVENTS_URI'))
-        websocket_url = urlunparse(("wss", str(parsed_url.netloc), "/ws", "", "", ""))
+        callback_uri = f"{CALLBACK_URI}/{guid}?{query_parameters}"
+        websocket_url = WEBSOCKET_URI
         return callback_uri, websocket_url
 
     async def handle_callback_event(self, event):
@@ -254,124 +220,115 @@ class RoomUserObserver(Subject):
         event_data = event["data"]
         call_connection_id = event_data.get("callConnectionId")
         event_type = event["type"]
-        if event_type == "Microsoft.Communication.CallConnected":
-            await self._handle_call_connected(event_data, call_connection_id)
-        elif event_type == "Microsoft.Communication.MediaStreamingStarted":
-            await self._handle_media_streaming_started(event_data, call_connection_id)
-        elif event_type == "Microsoft.Communication.MediaStreamingStopped":
-            await self._handle_media_streaming_stopped(event_data, call_connection_id)
-        elif event_type == "Microsoft.Communication.MediaStreamingFailed":
-            await self._handle_media_streaming_failed(event_data, call_connection_id)
-        else:
-            self._handle_callback_event_default(event_type, event_data, call_connection_id)
+
+        match event_type:
+            case "Microsoft.Communication.CallConnected":
+                await self._handle_call_connected(event_data, call_connection_id)
+            case "Microsoft.Communication.MediaStreamingStarted":
+                await self._handle_media_streaming_started(event_data, call_connection_id)
+            case "Microsoft.Communication.MediaStreamingStopped":
+                await self._handle_media_streaming_stopped(event_data, call_connection_id)
+            case "Microsoft.Communication.MediaStreamingFailed":
+                await self._handle_media_streaming_failed(event_data, call_connection_id)
+            case "Microsoft.Communication.ParticipantsUpdated":
+                await self._handle_participant_updated(event_data, call_connection_id)
+            case "Microsoft.Communication.AddParticipantFailed":
+                await self._handle_add_participant_failed(event_data, call_connection_id)                
+            case _:
+                self._handle_callback_event_default(event_type, event_data, call_connection_id)
         self.notify('callback_event', {"type": event_type, "call_connection_id": call_connection_id, "data": event_data})
         return {"call_connection_id": call_connection_id, "type": event_type}
 
     async def _handle_call_connected(self, event_data, call_connection_id):
+        logger.info(f"Connecting to call with id {call_connection_id}")
         if self.acs_client and call_connection_id:
             try:
                 call_connection = self.acs_client.get_call_connection(call_connection_id)
                 call_properties = call_connection.get_call_properties()
                 media_streaming_subscription = getattr(call_properties, "media_streaming_subscription", None)
-                self._call_connections[call_connection_id] = {
-                    **event_data,
-                    "media_streaming_subscription": media_streaming_subscription,
-                }
-                # Add bot as participant if bot info is available for this call/room
-                bot_info = self._call_connections.get(event_data.get('roomId') or event_data.get('room_id'))
-                if bot_info and bot_info.get('bot_identifier'):
-                    logging.info(
-                        "Adding bot '%s' as participant to ACS call (call_connection_id=%s)",
-                        bot_info.get('bot_display_name', 'Bot'),
-                        call_connection_id
-                    )
-                    try:
-                        add_result = call_connection.add_participant(target_participant=bot_info['bot_identifier'])
-                        logging.info(f"Bot add_participant result: {add_result}")
-                    except Exception as e:
-                        logging.error(f"Failed to add bot as participant: {e}")
-                from orchestrator.engine.client import TranslateCommand, Invoker
-                ws = self.get_websocket_for_connection(call_connection_id)
-                if ws:
-                    command = TranslateCommand(ws)
-                    invoker = Invoker(command, create_response=True)
-                    asyncio.create_task(self._start_translation(invoker))
+
+                self._call_connections[call_connection_id].last_event_data = event_data
+                self._call_connections[call_connection_id].media_streaming_subscription = media_streaming_subscription
+
+                call_info = self._call_connections.get(call_connection_id, None)
+
+                if not call_info:
+                    logger.error(f"No bot_info found for call_connection_id={call_connection_id}. Cannot join bot to call.")
+                    call_connection.hang_up(is_for_everyone=True)
+
+                bot_info = {'display_name': call_info.bot_display_name, 'language': call_info.bot_language}  #type: ignore
+                logger.info(f"bot_info for call_connection_id={call_connection_id}: {bot_info}")
+
+                self.join_bot_to_acs_call(call_connection_id, bot_info)
             except Exception as e:
-                logging.error(f"Failed to get call properties for {call_connection_id}: {e}")
+                logger.error(f"Failed to get call properties for {call_connection_id}: {e}")
 
     async def _handle_media_streaming_started(self, event_data, call_connection_id):
-        # Placeholder for handling MediaStreamingStarted event
-        self._call_connections[call_connection_id] = event_data
+        logger.info(f"Media streaming started for call_connection_id={call_connection_id}")
 
     async def _handle_media_streaming_stopped(self, event_data, call_connection_id):
-        # Placeholder for handling MediaStreamingStopped event
-        self._call_connections[call_connection_id] = event_data
+        logger.info(f"Media streaming stopped for call_connection_id={call_connection_id}")
+        if not call_connection_id in self._call_connections:
+            logger.warning(f"Call connection {call_connection_id} not found in active connections.")
+        call_connection = self.acs_client.get_call_connection(call_connection_id)
+        call_connection.hang_up(is_for_everyone=True)
 
     async def _handle_media_streaming_failed(self, event_data, call_connection_id):
-        # Placeholder for handling MediaStreamingFailed event
-        self._call_connections[call_connection_id] = event_data
+        logger.error(f"Media streaming failed for call_connection_id={call_connection_id}")
+        call_connection = self.acs_client.get_call_connection(call_connection_id)
+        call_connection.hang_up(is_for_everyone=True)
+
+    async def _handle_participant_updated(self, event_data, call_connection_id):
+        call_data = self._call_connections.get(call_connection_id)
+        participants = [
+            participant.communication_identifier.raw_id
+            for participant in self.rooms_client.list_participants(room_id=call_data.room_id)  # type: ignore
+        ]
+        logger.info(f"Participants updated for call_connection_id={call_connection_id}: {participants}")
+
+    async def _handle_add_participant_failed(self, event_data, call_connection_id):
+        logger.error(f"Failed to add participant to call_connection_id={call_connection_id}: {event_data.get('errorMessage', 'Unknown error')}")
+        call_connection = self.acs_client.get_call_connection(call_connection_id)
+        call_connection.hang_up(is_for_everyone=True)
+        logger.error(f"Failed to add participant to call_connection_id={call_connection_id}. Hanging up call.")
 
     def _handle_callback_event_default(self, event_type, event_data, call_connection_id):
-        if call_connection_id:
-            self._call_connections[call_connection_id] = event_data
+        logger.warning(f"Unhandled ACS callback event: {event_type} for call_connection_id={call_connection_id}")
 
-    async def _start_translation(self, invoker):
-        """Start translation session using the provided invoker."""
-        async with invoker as cmd:
-            await asyncio.sleep(0)
-
-    async def handle_incoming_audio(self, user_id: str, room_id: str, audio_b64: str, meta: dict):
+    def join_bot_to_acs_call(self, connection_id: str, bot_info: dict):
         """
-        Handle incoming audio from a user, interpret it with the client module, and distribute the result.
-        Args:
-            user_id (str): The user sending the audio.
-            room_id (str): The room the user is in.
-            audio_b64 (str): The base64-encoded audio data.
-            meta (dict): Additional metadata (e.g., language, timestamp).
+        Prepare the bot to join the ACS call for the given room.
+        The bot will be added as a participant after the call is established (in _handle_call_connected).
         """
-        call_connection_id = str(meta.get('call_connection_id', ''))
-        if not call_connection_id:
-            logging.warning(f"No call_connection_id provided in meta for user {user_id} in room {room_id}")
-            return
-        ws = self.get_websocket_for_connection(call_connection_id)
-        if not ws:
-            logging.warning(f"No websocket found for user {user_id} in room {room_id}")
-            return
-        from orchestrator.engine.client import TranslateCommand, Invoker
-        command = TranslateCommand(ws)
-        # Use user's preferred language from meta or default
-        entry_language = meta.get('language', 'en')
-        exit_language = meta.get('target_language', 'zh')
-        command.configure(entry_language=entry_language, exit_language=exit_language)
-        invoker = Invoker(command, create_response=True)
+        logger.info(
+            "Adding bot '%s' as participant to ACS call (call_connection_id=%s)",
+            bot_info.get('bot_display_name', 'Bot'),
+            connection_id
+        )
+        bot_user, bot_token = self.identity_client.create_user_and_token(scopes=["voip", "chat"])
+        current_connection = self._call_connections[connection_id]
+        current_connection.bot_id = bot_user.raw_id
 
-        audio_bytes = base64.b64decode(audio_b64)
-        async with invoker as cmd:
-            await command.send_audio_from_acs(audio_bytes, meta)
-            # Optionally, handle the response/streaming events here
+        room = self.rooms_client.get_room(current_connection.room_id)
+        if not room:
+            logger.error(f"Room with ID {current_connection.room_id} not found.")
+            raise RuntimeError(f"Room with ID {current_connection.room_id} not found.")
 
-    def join_bot_to_acs_call(self, room_id: str, bot_info: dict):
-        """
-        Prepare the bot to join the ACS call for the given room. The bot will be added as a participant after the call is established (in _handle_call_connected).
-        """
-        if not self.acs_client:
-            logging.error("ACS client not initialized. Cannot join bot to ACS call.")
-            raise RuntimeError("ACS client not initialized. Set AZURE_COMMUNICATION_CONNECTION_STRING.")
+        participant = RoomParticipant(
+            communication_identifier=bot_user,  # type: ignore
+            role=ParticipantRole.PRESENTER  # Adjust role as needed
+        )
 
-        # Always create a new ACS user for the bot (stateless, safe for demo)
-        bot_user = self.identity_client.create_user()
-        bot_identifier = CommunicationUserIdentifier(bot_user.properties['id'])
+        try:
+            self.rooms_client.add_or_update_participants(
+                room_id=current_connection.room_id,
+                participants=[participant]
+            )
+            logger.info(f"Bot successfully added as participant to room {current_connection.room_id} with ID {bot_user.raw_id}.")
+        except Exception as e:
+            logger.error(f"Failed to add bot as participant: {e}")
 
-        # Store bot info for later use in _handle_call_connected
-        self._call_connections[room_id] = {
-            "bot_identifier": bot_identifier,
-            "bot_display_name": bot_info.get('display_name', 'Bot'),
-            "room_id": room_id
-        }
-        logging.info(f"Bot info stored for room {room_id}, will add after call is established.")
-
-        # Optionally, you may want to trigger the call connection here if not already done
-        # (If connect_call is needed, ensure it is only called once per room/call)
+        logger.info(f"Bot info stored for room {connection_id}, will add after call is established.")
 
 
 class RoomUserEventObserver(Observer):
@@ -392,4 +349,4 @@ class LoggingObserver(Observer):
 
     def update(self, subject: Subject, event: RoomUserEvent) -> None:
         """Log the event details."""
-        print(f"[LoggingObserver] Event: {event.event_type}, User: {event.user_id}, Room: {event.room_id}, Data: {event.data}")
+        print(f"[LoggingObserver] Event: {event.event_type}, \n User: {event.user_id}, \n Room: {event.room_id}, \n Data: {event.data}")

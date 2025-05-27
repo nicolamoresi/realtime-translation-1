@@ -76,36 +76,6 @@ if not ACS_CONNECTION_STRING:
 identity_client = CommunicationIdentityClient.from_connection_string(ACS_CONNECTION_STRING)
 
 
-@app.on_event("startup")
-def ensure_demo_room():
-    """Ensure a persistent demo room and demo user exist on startup."""
-    try:
-        demo_room_id = str(uuid.uuid4())
-        logger.info(f"[ensure_demo_room] Creating demo room: {demo_room_id}")
-        # Try to get or create the demo room
-        try:
-            room_manager.get_room(demo_room_id)
-            logger.info(f"[ensure_demo_room] Demo room already exists: {demo_room_id}")
-        except Exception:
-            room_manager.create_room(valid_for_minutes=1440, participants=[])
-            logger.info(f"[ensure_demo_room] Created demo room: {demo_room_id}")
-        # Create a real ACS user for demo
-        demo_user = identity_client.create_user()
-        real_demo_user_id = getattr(demo_user, 'properties', {}).get("id", getattr(demo_user, 'id', None))
-        if not isinstance(real_demo_user_id, str) or not real_demo_user_id:
-            logger.error(f"[ensure_demo_room] Failed to create a valid ACS user for demo room.")
-            return
-        logger.info(f"[ensure_demo_room] Created demo ACS user: {real_demo_user_id}")
-        # Add demo user as Presenter to demo room
-        try:
-            room_manager.add_or_update_participants(demo_room_id, [RoomParticipant(id=real_demo_user_id, role="Presenter", join_time=None)])
-            logger.info(f"[ensure_demo_room] Added demo user {real_demo_user_id} as Presenter to demo room {demo_room_id}")
-        except Exception as e:
-            logger.error(f"[ensure_demo_room] Failed to add demo user to demo room: {e}")
-    except Exception as e:
-        logger.error(f"Failed to ensure demo room/user: {e}")
-
-
 @app.post("/rooms", response_model=RoomModel, tags=["Rooms"])
 def create_room(
     valid_for_minutes: int = Body(60, embed=True),

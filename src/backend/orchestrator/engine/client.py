@@ -49,6 +49,11 @@ Wait until the speaker is done speaking before you start translating, and transl
 - ONLY RESPOND WITH THE TRANSLATED TEXT. DO NOT ADD ANY OTHER TEXT, EXPLANATIONS, OR CONTEXTUAL INFORMATION.
 """)
 
+AZURE_OPENAI_API_KEY=os.getenv("AZURE_OPENAI_API_KEY", "")
+AZURE_OPENAI_API_VERSION=os.getenv("AZURE_OPENAI_API_VERSION", "2024-10-01-preview")
+AZURE_OPENAI_ENDPOINT=os.getenv("AZURE_OPENAI_ENDPOINT", "")
+AZURE_OPENAI_DEPLOYMENT=os.getenv("AZURE_OPENAI_DEPLOYMENT", "")
+
 
 class AOAITranslationClient(ABC):
     """Abstract base for Azure OpenAI real-time translation clients.
@@ -65,9 +70,10 @@ class AOAITranslationClient(ABC):
         """
         self.kernel = Kernel()
         self._raw_ws = AzureRealtimeWebsocket(
-            api_key=os.getenv("AZURE_OPENAI_API_KEY"),
-            api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2024-10-01-preview"),
-            azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT", "")
+            api_key=AZURE_OPENAI_API_KEY,
+            api_version=AZURE_OPENAI_API_VERSION,
+            azure_endpoint=AZURE_OPENAI_ENDPOINT,
+            deployment_name=AZURE_OPENAI_DEPLOYMENT
         )
         self.create_response: bool = False
         self.available = self._check_configuration()
@@ -171,7 +177,6 @@ class TranslateCommand(AOAITranslationClient):
                 input_audio_transcription={"model": "whisper-1"},
                 function_choice_behavior=FunctionChoiceBehavior.Auto(),
             )
-        raise ValueError("Client not properly configured. Please check your environment variables.")
 
 
 class Invoker:
@@ -205,18 +210,21 @@ class Invoker:
 
     async def __aenter__(self):
         """Enter context: configure command and open websocket."""
-        self.command.configure()
         await self.command(
             settings=self.command.settings,
             create_response=self.create_response,
-            kernel=self.kernel,
+            kernel=self.kernel
         )
-        return self.command
+        await self.command._raw_ws.__aenter__()
+        return self
 
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
+    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
         """Exit context: cleanly close the websocket connection."""
         if self.command:
             await self.command._raw_ws.__aexit__(exc_type, exc_val, exc_tb)
+
+    async def start(self) -> None:
+        await self.command.ws.accept()
 
     async def _from_realtime_to_acs(self, audio: ndarray):
         """Forward model-generated audio to ACS via WebSocket.
@@ -248,15 +256,11 @@ class Invoker:
                     await client.send(
                         event=RealtimeAudioEvent(
                             audio=AudioContent(
-                                data=data.get("audioData", {}).get("data"), data_format="base64", inner_content=data),
+                                data=data.get("audioData", {}).get("data"),
+                                data_format="base64",
+                                inner_content=data
+                            ),
                         )
                     )
         except Exception:
             logger.info("Websocket connection closed.")
-
-
-__all__ = [
-    "AOAITranslationClient",
-    "TranslateCommand",
-    "Invoker",
-]

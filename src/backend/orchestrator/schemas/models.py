@@ -102,3 +102,15 @@ class Tool(BaseModel):
     description: str = Field(..., description="Tool Description")
     func: Callable[..., Any] = Field(..., description="Tool Function")
 
+
+class CallConnectionInfo(BaseModel):
+    caller_id: str
+    room_id: str
+    callback_uri: str
+    websocket_url: str
+    call_connection_id: str
+    bot_display_name: str
+    bot_language: str
+    bot_id: Optional[str] = None
+    media_streaming_subscription: Optional[str] = None
+    last_event_data: Optional[dict] = None

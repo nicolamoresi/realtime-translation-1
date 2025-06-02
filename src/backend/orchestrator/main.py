@@ -12,6 +12,7 @@ Attributes:
 import os
 import time
 import asyncio
+from orchestrator.engine import Invoker
 import psutil
 from fastapi import FastAPI, Request, WebSocket
 from fastapi.security import OAuth2PasswordBearer
@@ -119,26 +120,20 @@ async def ws(websocket: WebSocket):
 
     call_connection_id = websocket.headers.get("x-ms-call-connection-id")
     room_user_observer = app.state.room_user_observer
+
     try:
-        invoker = room_user_observer.enable_invoker(call_connection_id, websocket)
+        invoker: Invoker = room_user_observer.enable_invoker(call_connection_id, websocket)
     except Exception as e:
         logger.error(f"WebSocket handler error: {e}")
         await websocket.close()
         return
-    while True:
-        async with invoker:
-            try:
-                # run both loops until the websocket closes
-                await asyncio.gather(
-                    invoker.command._from_acs_to_realtime(),
-                    invoker.command._from_realtime_to_acs(),
-                )
-            except Exception as e:
-                logger.error(f"WebSocket translation session error: {e}")
-                break
-            finally:
-                # Ensure cleanup of the invoker on disconnect
-                await room_user_observer.cleanup_invoker(call_connection_id)
+    async with invoker:
+        try:
+            receive_task = asyncio.create_task(invoker.command.handle_realtime_messages())
+            await invoker.command._from_acs_to_realtime()
+            receive_task.cancel()
+        except Exception as e:
+            logger.error(f"WebSocket translation session error: {e}")
 
 
 @app.post("/incoming-call")
@@ -151,7 +146,7 @@ async def incoming_call_handler(request: Request):
     Returns:
         SuccessMessage: Result of call handling or subscription validation.
     """
-    
+
     data = await request.json()
     room_user_observer = app.state.room_user_observer
     for event_dict in data:

@@ -20,8 +20,9 @@ from fastapi import WebSocket
 
 from semantic_kernel import Kernel
 from semantic_kernel.connectors.ai import FunctionChoiceBehavior
-from semantic_kernel.connectors.ai.open_ai import AzureRealtimeExecutionSettings, AzureRealtimeWebsocket
 from semantic_kernel.contents import AudioContent, RealtimeAudioEvent, RealtimeTextEvent
+from semantic_kernel.connectors.ai.open_ai import AzureRealtimeExecutionSettings, AzureRealtimeWebsocket
+from semantic_kernel.connectors.ai.open_ai.services._open_ai_realtime import ListenEvents
 
 from orchestrator import logger
 
@@ -136,7 +137,14 @@ class AOAITranslationClient(ABC):
 
         Must set self.settings to a valid AzureRealtimeExecutionSettings.
         """
-        pass
+
+    @abstractmethod
+    async def handle_realtime_messages(self):
+        """Handle real-time messages from the model and forward them to ACS.
+
+        This method should be implemented to process incoming audio data and
+        send it to the Azure Communication Services (ACS) client.
+        """
 
     @abstractmethod
     async def _from_realtime_to_acs(self):
@@ -184,87 +192,59 @@ class TranslateCommand(AOAITranslationClient):
                 function_choice_behavior=FunctionChoiceBehavior.Auto(),
             )
 
-    async def _from_realtime_to_acs(self):
+    async def _from_realtime_to_acs(self, audio: ndarray):
+        logger.debug("Audio received from the model, sending to ACS client")
+        try:
+            await self.ws.send_json(
+                {"Kind": "AudioData", "AudioData": {"data": base64.b64encode(audio.tobytes()).decode("utf-8")}}
+            )
+        except Exception as e:
+            logger.error(f"[TranslateCommand] Error sending audio to ACS: {e}")
+
+    async def handle_realtime_messages(self):
         """Forward model-generated audio to ACS via WebSocket, optimized for low latency and with detailed logging."""
         logger.info("[TranslateCommand] Starting _from_realtime_to_acs audio streaming loop.")
-        while True:
-            try:
-                async for event in self._raw_ws.receive():
-                    match event:
-                        case RealtimeTextEvent():
-                            logger.info(f"[TranslateCommand] Received text event: {event.text}")
-                        case RealtimeAudioEvent():
-                            audio = event.audio.data
-                            logger.debug(f"[TranslateCommand] Received audio event: type={type(audio)}, len={len(audio) if audio is not None else 0}")
-                            if audio is None:
-                                logger.info("[TranslateCommand] Received None audio data from model.")
-                                continue
-                            if isinstance(audio, ndarray):
-                                audio = audio.tobytes()
-                                logger.info(f"[TranslateCommand] Converted ndarray to bytes, len={len(audio)}")
-
-                            # send metadata frame before audio
-                            metadata = {
-                                "kind": "AudioMetadata",
-                                "audioMetadata": {
-                                    "timestamp": datetime.utcnow().isoformat() + "Z",
-                                    "silent": False
-                                }
-                            }
-                            try:
-                                if self.ws.client_state.name != "CONNECTED":
-                                    logger.warning("[TranslateCommand] WebSocket is not connected, breaking loop.")
-                                    break
-                                await self.ws.send_json(metadata)
-                                logger.info("[TranslateCommand] Sent AudioMetadata frame to ACS.")
-                                setattr(self.ws, "last_activity", time.time())
-                            except Exception as e:
-                                logger.error(f"[TranslateCommand] Error sending AudioMetadata: {str(e)}")
-                                break
-                            try:
-                                logger.info(f"[TranslateCommand] Sending AudioData frame to ACS, type={type(audio)}, lenght={len(audio)}.")
-                                try:
-                                    await self.ws.send_bytes(audio)
-                                except Exception as e:
-                                    logger.error(f"[TranslateCommand] Error sending audio bytes: {str(e)}")
-                                    logger.info(f"[TranslateCommand] Will try to send json frame instead.")
-
-                                data_payload = {
-                                    "kind": "AudioData",
-                                    "audioData": {
-                                        "data": base64.b64encode(audio).decode("ascii")
-                                    }
-                                }
-                                if self.ws.client_state.name != "CONNECTED":
-                                    logger.warning("[TranslateCommand] WebSocket is not connected, breaking loop.")
-                                    break
-                                await self.ws.send_json(data_payload)
-                                logger.debug(f"[TranslateCommand] Sent AudioData frame to ACS, bytes={len(audio)}.")
-                                setattr(self.ws, "last_activity", time.time())
-                            except Exception as e:
-                                logger.error(f"[TranslateCommand] Error sending AudioData: {e}")
-                                break
-                        case _:
-                            logger.warning(f"[TranslateCommand] Received unexpected event type: {type(event)}")
-            except Exception as exc:
-                logger.error(f"[TranslateCommand] Exception in _from_realtime_to_acs: {exc}")
-                break
-            logger.info("[TranslateCommand] Exiting _from_realtime_to_acs audio streaming loop.")
+        try:
+            async for event in self._raw_ws.receive(audio_output_callback=self._from_realtime_to_acs):
+                match event.service_type:
+                    case ListenEvents.SESSION_CREATED:
+                        logger.info("Session Created Message")
+                        logger.debug(f"  Session Id: {event.service_event.session.id}")  #type: ignore
+                    case ListenEvents.ERROR:
+                        logger.error(f"  Error: {event.service_event.error}")  #type: ignore
+                    case ListenEvents.INPUT_AUDIO_BUFFER_CLEARED:
+                        logger.info("[TranslateCommand] Input audio buffer cleared.")
+                    case ListenEvents.INPUT_AUDIO_BUFFER_SPEECH_STARTED:
+                        logger.debug(f"Voice activity detection started at {event.service_event.audio_start_ms} [ms]")  #type: ignore
+                        await self.ws.send_json({"Kind": "StopAudio", "AudioData": None, "StopAudio": {}})
+                    case ListenEvents.CONVERSATION_ITEM_INPUT_AUDIO_TRANSCRIPTION_COMPLETED:
+                        logger.info(f" User:-- {event.service_event.transcript}")  #type: ignore
+                    case ListenEvents.CONVERSATION_ITEM_INPUT_AUDIO_TRANSCRIPTION_FAILED:
+                        logger.error(f"  Error: {event.service_event.error}")  #type: ignore
+                    case ListenEvents.RESPONSE_DONE:
+                        logger.info("Response Done Message")
+                        logger.debug(f"  Response Id: {event.service_event.response.id}")  #type: ignore
+                        if event.service_event.response.status_details:  #type: ignore
+                            logger.debug(
+                                f"  Status Details: {event.service_event.response.status_details.model_dump_json()}"  #type: ignore
+                            )
+                    case ListenEvents.RESPONSE_AUDIO_TRANSCRIPT_DONE:
+                        logger.info(f" AI:-- {event.service_event.transcript}")  #type: ignore
+                    case _:
+                        logger.warning(f"[TranslateCommand] Received unexpected event type: {type(event)}")
+        except Exception as exc:
+            logger.error(f"[TranslateCommand] Exception in _from_realtime_to_acs: {exc}")
+            raise
+        logger.info("[TranslateCommand] Exiting _from_realtime_to_acs audio streaming loop.")
 
     async def _from_acs_to_realtime(self):
         """Forward audio coming in from ACS (binary frames) into the Azure OpenAI websocket."""
         while True:
             try:
-                msg = await self.ws.receive()
+                msg = await self.ws.receive_json()
                 setattr(self.ws, "last_activity", time.time())
-                if msg["type"] == "websocket.disconnect":
-                    logger.info("[TranslateCommand] WebSocket disconnect received from ACS.")
-                    break
-
-                # JSON‐text frames (metadata)
                 if msg.get("text"):
                     try:
-                        # Only try to decode as JSON if it looks like JSON
                         if msg["text"].strip().startswith("{"):
                             payload = json.loads(msg["text"])
                         else:
@@ -273,34 +253,21 @@ class TranslateCommand(AOAITranslationClient):
                     except Exception as e:
                         logger.error(f"[TranslateCommand] Error decoding JSON from ACS: {str(e)}")
                         continue
+                else:
+                    payload = msg
                     if payload.get("kind") == "AudioMetadata":
                         continue
                     if payload.get("kind") == "AudioData":
-                        b64 = payload["audioData"]["data"]
-                        audio_bytes = base64.b64decode(b64)
                         await self._raw_ws.send(
                             event=RealtimeAudioEvent(
                                 audio=AudioContent(
-                                    data=audio_bytes,
-                                    data_format="pcm16",
-                                    inner_content=None
+                                    data=payload["audioData"]["data"],
+                                    data_format="base64",
+                                    inner_content=msg.get("text")
                                 )
                             )
                         )
                         continue
-
-                # binary frames (raw audio)
-                if msg.get("bytes") is not None:
-                    audio_bytes = msg["bytes"]
-                    await self._raw_ws.send(
-                        event=RealtimeAudioEvent(
-                            audio=AudioContent(
-                                data=audio_bytes,
-                                data_format="pcm16",
-                                inner_content=None
-                            )
-                        )
-                    )
             except Exception as e:
                 logger.info(f"[TranslateCommand] WebSocket connection closed or error: {e}")
                 break

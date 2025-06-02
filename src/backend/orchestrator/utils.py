@@ -46,21 +46,18 @@ def generate_user_id(username: str) -> str:
     return username
 
 
-async def cleanup_session(session_id: str) -> None:
-    """Clean up and remove a session and its resources.
+async def cleanup_session(call_connection_id: str) -> None:
+    """Clean up and remove a call connection and its resources.
 
     Args:
-        session_id (str): The session ID to clean up.
+        call_connection_id (str): The call connection ID to clean up.
     """
-    client = sessions.pop(session_id, None)
-    track_ids.pop(session_id, None)
-    user_id = session_users.pop(session_id, None)
-    if user_id:
-        user_sessions.pop(user_id, None)
+    client = sessions.pop(call_connection_id, None)
+    track_ids.pop(call_connection_id, None)
     # If the client has a disconnect method, call it
     if client and hasattr(client, "_raw_ws"):
         await client._raw_ws.__aexit__(None, None, None)
-        logger.info(f"Disconnected client for session {session_id}")
+        logger.info(f"Disconnected client for call_connection_id {call_connection_id}")
 
 
 def get_client_or_404(session_id: str) -> TranslateCommand:

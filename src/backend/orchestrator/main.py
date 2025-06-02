@@ -11,7 +11,7 @@ Attributes:
 
 import os
 import time
-import json
+import asyncio
 import psutil
 from fastapi import FastAPI, Request, WebSocket
 from fastapi.security import OAuth2PasswordBearer
@@ -21,7 +21,6 @@ from starlette.middleware.cors import CORSMiddleware
 from orchestrator import __app__, __author__, __version__, logger
 from orchestrator.schemas import SuccessMessage
 from orchestrator.background import lifespan
-from orchestrator.engine import TranslateCommand, Invoker
 from orchestrator.utils import session_users
 
 
@@ -116,37 +115,30 @@ async def ws(websocket: WebSocket):
 
     The translation loop will continue until the WebSocket is disconnected.
     """
-    # Accept the connection
     await websocket.accept()
 
     call_connection_id = websocket.headers.get("x-ms-call-connection-id")
     room_user_observer = app.state.room_user_observer
-
-    translate_command = TranslateCommand(ws=websocket)
-    translate_command.configure(entry_language="en", exit_language="zh")  # Adjust languages as needed
-    invoker = Invoker(command=translate_command)
-    room_user_observer.register_invoker(call_connection_id, invoker)
-
-    async with invoker:
-        try:
-            while True:
-                # Receive audio data from the websocket (from ACS or client)
-                data = await websocket.receive()
-                if data["type"] == "websocket.disconnect":
-                    break
-                data_dict = json.loads(data.get('text', ''))
-                if data_dict.get('kind') == 'AudioData':
-                    audio_bytes = data_dict.get('audioData', {}).get('data', b'')
-                    # Send audio to AOAI for translation
-                    await invoker.command.send_audio_from_acs(audio_bytes, meta={
-                        "call_connection_id": call_connection_id,
-                    })
-                    # Stream translated events back to the websocket (if needed)
-                    async for event in invoker.command.receive_events():
-                        # You can customize what to send back; here, just send the event as JSON
-                        await websocket.send_json(event if isinstance(event, dict) else event.__dict__)
-        except Exception as e:
-            logger.error(f"WebSocket translation session error: {e}")
+    try:
+        invoker = room_user_observer.enable_invoker(call_connection_id, websocket)
+    except Exception as e:
+        logger.error(f"WebSocket handler error: {e}")
+        await websocket.close()
+        return
+    while True:
+        async with invoker:
+            try:
+                # run both loops until the websocket closes
+                await asyncio.gather(
+                    invoker.command._from_acs_to_realtime(),
+                    invoker.command._from_realtime_to_acs(),
+                )
+            except Exception as e:
+                logger.error(f"WebSocket translation session error: {e}")
+                break
+            finally:
+                # Ensure cleanup of the invoker on disconnect
+                await room_user_observer.cleanup_invoker(call_connection_id)
 
 
 @app.post("/incoming-call")

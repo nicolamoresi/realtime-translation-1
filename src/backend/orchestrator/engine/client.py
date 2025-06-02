@@ -5,8 +5,10 @@ This module defines the AOAITranslationClient base class, the TranslateCommand f
 """
 
 import os
+import json
 import base64
-import logging
+from datetime import datetime
+import time
 
 from abc import ABC, abstractmethod
 from typing import Optional
@@ -18,16 +20,11 @@ from fastapi import WebSocket
 
 from semantic_kernel import Kernel
 from semantic_kernel.connectors.ai import FunctionChoiceBehavior
-from semantic_kernel.connectors.ai.open_ai import (
-    AzureRealtimeExecutionSettings,
-    AzureRealtimeWebsocket,
-)
-from semantic_kernel.connectors.ai.realtime_client_base import RealtimeClientBase
-from semantic_kernel.contents import AudioContent, RealtimeAudioEvent
+from semantic_kernel.connectors.ai.open_ai import AzureRealtimeExecutionSettings, AzureRealtimeWebsocket
+from semantic_kernel.contents import AudioContent, RealtimeAudioEvent, RealtimeTextEvent
 
+from orchestrator import logger
 
-# Configure logging
-logger = logging.getLogger(__name__)
 
 
 INTERPRETER_PROMPT = Template("""
@@ -62,7 +59,7 @@ class AOAITranslationClient(ABC):
     underlying AzureRealtimeWebsocket as an async context manager.
     """
 
-    def __init__(self, ws: WebSocket, observer=None):
+    def __init__(self, observer=None):
         """
         Args:
             ws (WebSocket): The FastAPI WebSocket connection.
@@ -77,15 +74,13 @@ class AOAITranslationClient(ABC):
         )
         self.create_response: bool = False
         self.available = self._check_configuration()
-        self.ws: WebSocket = ws
+        self._websocket: WebSocket
         self.settings: AzureRealtimeExecutionSettings
         self.observer = observer
 
-    async def __call__(
+    def __call__(
         self,
-        settings: AzureRealtimeExecutionSettings,
-        create_response: bool = True,
-        kernel: Optional[Kernel] = None
+        create_response: bool = True
     ):
         """Prepare and return the AzureRealtimeWebsocket context manager.
 
@@ -97,45 +92,42 @@ class AOAITranslationClient(ABC):
         Returns:
             An async context manager for AzureRealtimeWebsocket.
         """
-        self.settings = settings
         self.create_response = create_response
-        if kernel:
-            self.kernel = kernel
-
-        return self._raw_ws(
-            settings=settings,
-            create_response=create_response,
-            kernel=self.kernel
+        self._raw_ws(
+            settings=self.settings,
+            kernel=self.kernel,
+            create_response=create_response
         )
 
-    async def send_audio_from_acs(self, audio_data: bytes, meta: dict) -> None:
-        """Send audio from ACS to the model."""
-        await self._raw_ws.send(
-            event=RealtimeAudioEvent(
-                audio=AudioContent(data=audio_data, data_format="base64", inner_content=meta),
-            )
-        )
-
-    async def receive_events(self, audio_output_callback=None):
+    async def _receive_events(self, audio_output_callback=None):
         """Async generator for model events, with optional audio callback."""
         async for event in self._raw_ws.receive(audio_output_callback=audio_output_callback):
             if self.observer:
                 await self.observer.handle_event(event)
             yield event
 
+    @property
+    def ws(self) -> WebSocket:
+        return self._websocket
+
+    @ws.setter
+    def ws(self, websocket: WebSocket):
+        self._websocket = websocket
+
     def _check_configuration(self) -> bool:
-        """Verify required environment variables are set.
-
-        Returns:
-            bool: True if configuration is valid; False otherwise.
-        """
-        required_vars = ["AZURE_OPENAI_API_KEY", "AZURE_OPENAI_ENDPOINT"]
-        missing = [var for var in required_vars if not os.getenv(var)]
-
+        """Verify required environment variables are set and log their values for debugging."""
+        required_vars = [
+            ("AZURE_OPENAI_API_KEY", AZURE_OPENAI_API_KEY),
+            ("AZURE_OPENAI_ENDPOINT", AZURE_OPENAI_ENDPOINT),
+            ("AZURE_OPENAI_API_VERSION", AZURE_OPENAI_API_VERSION),
+            ("AZURE_OPENAI_DEPLOYMENT", AZURE_OPENAI_DEPLOYMENT),
+        ]
+        missing = [var for var, val in required_vars if not val]
+        for var, val in required_vars:
+            logger.info(f"[AOAITranslationClient] {var}={'SET' if val else 'MISSING'}")
         if missing:
-            logger.warning(f"Azure OpenAI client missing configuration: {', '.join(missing)}")
+            logger.warning(f"[AOAITranslationClient] Azure OpenAI client missing configuration: {', '.join(missing)}")
             return False
-
         return True
 
     @abstractmethod
@@ -145,6 +137,20 @@ class AOAITranslationClient(ABC):
         Must set self.settings to a valid AzureRealtimeExecutionSettings.
         """
         pass
+
+    @abstractmethod
+    async def _from_realtime_to_acs(self):
+        """Configure client settings before invocation.
+
+        Must set self.settings to a valid AzureRealtimeExecutionSettings.
+        """
+
+    @abstractmethod
+    async def _from_acs_to_realtime(self):
+        """Configure client settings before invocation.
+
+        Must set self.settings to a valid AzureRealtimeExecutionSettings.
+        """
 
 
 class TranslateCommand(AOAITranslationClient):
@@ -178,6 +184,127 @@ class TranslateCommand(AOAITranslationClient):
                 function_choice_behavior=FunctionChoiceBehavior.Auto(),
             )
 
+    async def _from_realtime_to_acs(self):
+        """Forward model-generated audio to ACS via WebSocket, optimized for low latency and with detailed logging."""
+        logger.info("[TranslateCommand] Starting _from_realtime_to_acs audio streaming loop.")
+        while True:
+            try:
+                async for event in self._raw_ws.receive():
+                    match event:
+                        case RealtimeTextEvent():
+                            logger.info(f"[TranslateCommand] Received text event: {event.text}")
+                        case RealtimeAudioEvent():
+                            audio = event.audio.data
+                            logger.debug(f"[TranslateCommand] Received audio event: type={type(audio)}, len={len(audio) if audio is not None else 0}")
+                            if audio is None:
+                                logger.info("[TranslateCommand] Received None audio data from model.")
+                                continue
+                            if isinstance(audio, ndarray):
+                                audio = audio.tobytes()
+                                logger.info(f"[TranslateCommand] Converted ndarray to bytes, len={len(audio)}")
+
+                            # send metadata frame before audio
+                            metadata = {
+                                "kind": "AudioMetadata",
+                                "audioMetadata": {
+                                    "timestamp": datetime.utcnow().isoformat() + "Z",
+                                    "silent": False
+                                }
+                            }
+                            try:
+                                if self.ws.client_state.name != "CONNECTED":
+                                    logger.warning("[TranslateCommand] WebSocket is not connected, breaking loop.")
+                                    break
+                                await self.ws.send_json(metadata)
+                                logger.info("[TranslateCommand] Sent AudioMetadata frame to ACS.")
+                                setattr(self.ws, "last_activity", time.time())
+                            except Exception as e:
+                                logger.error(f"[TranslateCommand] Error sending AudioMetadata: {str(e)}")
+                                break
+                            try:
+                                logger.info(f"[TranslateCommand] Sending AudioData frame to ACS, type={type(audio)}, lenght={len(audio)}.")
+                                try:
+                                    await self.ws.send_bytes(audio)
+                                except Exception as e:
+                                    logger.error(f"[TranslateCommand] Error sending audio bytes: {str(e)}")
+                                    logger.info(f"[TranslateCommand] Will try to send json frame instead.")
+
+                                data_payload = {
+                                    "kind": "AudioData",
+                                    "audioData": {
+                                        "data": base64.b64encode(audio).decode("ascii")
+                                    }
+                                }
+                                if self.ws.client_state.name != "CONNECTED":
+                                    logger.warning("[TranslateCommand] WebSocket is not connected, breaking loop.")
+                                    break
+                                await self.ws.send_json(data_payload)
+                                logger.debug(f"[TranslateCommand] Sent AudioData frame to ACS, bytes={len(audio)}.")
+                                setattr(self.ws, "last_activity", time.time())
+                            except Exception as e:
+                                logger.error(f"[TranslateCommand] Error sending AudioData: {e}")
+                                break
+                        case _:
+                            logger.warning(f"[TranslateCommand] Received unexpected event type: {type(event)}")
+            except Exception as exc:
+                logger.error(f"[TranslateCommand] Exception in _from_realtime_to_acs: {exc}")
+                break
+            logger.info("[TranslateCommand] Exiting _from_realtime_to_acs audio streaming loop.")
+
+    async def _from_acs_to_realtime(self):
+        """Forward audio coming in from ACS (binary frames) into the Azure OpenAI websocket."""
+        while True:
+            try:
+                msg = await self.ws.receive()
+                setattr(self.ws, "last_activity", time.time())
+                if msg["type"] == "websocket.disconnect":
+                    logger.info("[TranslateCommand] WebSocket disconnect received from ACS.")
+                    break
+
+                # JSON‐text frames (metadata)
+                if msg.get("text"):
+                    try:
+                        # Only try to decode as JSON if it looks like JSON
+                        if msg["text"].strip().startswith("{"):
+                            payload = json.loads(msg["text"])
+                        else:
+                            logger.warning("[TranslateCommand] Received text frame that does not look like JSON, skipping.")
+                            continue
+                    except Exception as e:
+                        logger.error(f"[TranslateCommand] Error decoding JSON from ACS: {str(e)}")
+                        continue
+                    if payload.get("kind") == "AudioMetadata":
+                        continue
+                    if payload.get("kind") == "AudioData":
+                        b64 = payload["audioData"]["data"]
+                        audio_bytes = base64.b64decode(b64)
+                        await self._raw_ws.send(
+                            event=RealtimeAudioEvent(
+                                audio=AudioContent(
+                                    data=audio_bytes,
+                                    data_format="pcm16",
+                                    inner_content=None
+                                )
+                            )
+                        )
+                        continue
+
+                # binary frames (raw audio)
+                if msg.get("bytes") is not None:
+                    audio_bytes = msg["bytes"]
+                    await self._raw_ws.send(
+                        event=RealtimeAudioEvent(
+                            audio=AudioContent(
+                                data=audio_bytes,
+                                data_format="pcm16",
+                                inner_content=None
+                            )
+                        )
+                    )
+            except Exception as e:
+                logger.info(f"[TranslateCommand] WebSocket connection closed or error: {e}")
+                break
+            logger.info("[TranslateCommand] Exiting _from_acs_to_realtime audio streaming loop.")
 
 class Invoker:
     """Invoker context manager for running translation commands.
@@ -210,11 +337,7 @@ class Invoker:
 
     async def __aenter__(self):
         """Enter context: configure command and open websocket."""
-        await self.command(
-            settings=self.command.settings,
-            create_response=self.create_response,
-            kernel=self.kernel
-        )
+        self.command(create_response=self.create_response)
         await self.command._raw_ws.__aenter__()
         return self
 
@@ -226,41 +349,19 @@ class Invoker:
     async def start(self) -> None:
         await self.command.ws.accept()
 
-    async def _from_realtime_to_acs(self, audio: ndarray):
-        """Forward model-generated audio to ACS via WebSocket.
-
-        Args:
-            audio (ndarray): PCM audio samples from the model.
-        """
-        logger.debug("Audio received from the model, sending to ACS client")
-        await self.command.ws.send(
-            {
-                "kind": "AudioData",
-                "audioData": {
-                    "data": base64.b64encode(audio.tobytes()).decode("utf-8")
-                }
-            }
-        )
-
-    async def _from_acs_to_realtime(self, client: RealtimeClientBase):
-        """Inward model-generated audio to AzureOpenAI via WebSocket.
-
-        Args:
-            client (RealtimeClientBase): A realtime sk client that implements the integration.
-        """
-        try:
-            data = await self.command.ws.receive()
-            while data:
-                if data.get("kind", None) == "AudioData":
-                    # send it to the Realtime service
-                    await client.send(
-                        event=RealtimeAudioEvent(
-                            audio=AudioContent(
-                                data=data.get("audioData", {}).get("data"),
-                                data_format="base64",
-                                inner_content=data
-                            ),
-                        )
-                    )
-        except Exception:
-            logger.info("Websocket connection closed.")
+    async def open_if_closed(self):
+        """Re-open the websocket connection if it is closed. Safe to call before sending/receiving new data."""
+        ws = getattr(self.command, "_raw_ws", None)
+        if ws is None:
+            logger.warning("[Invoker] No _raw_ws found on command; cannot check connection state.")
+            return
+        # Check if the websocket is closed (assume _raw_ws has an 'closed' or 'is_closed' property, fallback to context manager state)
+        is_closed = getattr(ws, "closed", None)
+        if is_closed is None:
+            # Fallback: try to check if context manager has exited
+            is_closed = getattr(ws, "_closed", False)
+        if is_closed:
+            logger.info("[Invoker] Websocket is closed, re-opening via __aenter__.")
+            await ws.__aenter__()
+        else:
+            logger.debug("[Invoker] Websocket is already open; no action taken.")

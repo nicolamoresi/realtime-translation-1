@@ -31,6 +31,7 @@ azure-communication-callautomation = {version = "^1.4.0b1", allow-prereleases = 
 azure-communication-rooms = {version = "^1.2.0", allow-prereleases = true}
 azure-communication-identity = "^1.4.0"
 pypdf2 = "^3.0.1"
+azure-cognitiveservices-speech = "^1.44.0"
 
 
 [tool.poetry.group.dev.dependencies]

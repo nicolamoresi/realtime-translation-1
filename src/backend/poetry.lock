@@ -414,6 +414,25 @@ files = [
 ]
 
 [[package]]
+name = "azure-cognitiveservices-speech"
+version = "1.44.0"
+description = "Microsoft Cognitive Services Speech SDK for Python"
+optional = false
+python-versions = ">=3.7"
+groups = ["main"]
+files = [
+    {file = "azure_cognitiveservices_speech-1.44.0-py3-none-macosx_10_14_x86_64.whl", hash = "sha256:78037a147ba72abb57e8c10b693d43a1bb029986fae0918f1f9b7d6342737bfe"},
+    {file = "azure_cognitiveservices_speech-1.44.0-py3-none-macosx_11_0_arm64.whl", hash = "sha256:2c9b436326cd8dd82dfa88454b7b68359dfc7149e2ac9029f9bcff155ebd5c95"},
+    {file = "azure_cognitiveservices_speech-1.44.0-py3-none-manylinux1_x86_64.whl", hash = "sha256:e5f07fc0587067850288c17aebf33d307d2c1ef9e0b2d11d9f44bff2af400568"},
+    {file = "azure_cognitiveservices_speech-1.44.0-py3-none-manylinux2014_aarch64.whl", hash = "sha256:3461e22cf04816f69a964d936218d920240f987c0656fdaaf46571529ff0f7e6"},
+    {file = "azure_cognitiveservices_speech-1.44.0-py3-none-win32.whl", hash = "sha256:a3fe7fd67ba7db281ae490de3d71b5a22648454ec2630eb6a70797f666330586"},
+    {file = "azure_cognitiveservices_speech-1.44.0-py3-none-win_amd64.whl", hash = "sha256:77cfb5dd40733b7ccc21edc427e9fb4720997832ea8a1ba460dc94345f3588ae"},
+]
+
+[package.dependencies]
+azure-core = ">=1.31.0"
+
+[[package]]
 name = "azure-communication-callautomation"
 version = "1.4.0b1"
 description = "Microsoft Azure Communication Call Automation Client Library for Python"
@@ -6221,4 +6240,4 @@ cffi = ["cffi (>=1.11)"]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.12, <4.0"
-content-hash = "2a8f03617fe9b19cb7e37a700efab95a58f8ebb02e1a223d1f7e18e5c3008499"
+content-hash = "d583b5759c4c485f7fe3a1f17f2acb622a1622c7d2fe1af3174d968385696068"

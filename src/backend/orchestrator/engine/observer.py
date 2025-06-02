@@ -19,7 +19,8 @@ from azure.communication.rooms import RoomsClient, RoomParticipant, ParticipantR
 from azure.communication.identity import CommunicationIdentityClient
 from azure.eventgrid import EventGridEvent, SystemEventNames
 
-from orchestrator.engine import Invoker
+from fastapi import WebSocket
+from orchestrator.engine import Invoker, TranslateCommand
 from orchestrator.schemas.models import CallConnectionInfo
 from orchestrator import logger
 
@@ -100,7 +101,6 @@ class RoomUserObserver(Subject):
         self._user_info: Dict[str, Dict[str, Any]] = {}
         self._call_connections: Dict[str, CallConnectionInfo] = {}
         self._invokers: Dict[str, Invoker] = {}
-        self._connection_session: Dict[str, str] = {}
         acs_conn_str = os.environ.get("ACS_CONNECTION_STRING", "")
         self.acs_client = CallAutomationClient.from_connection_string(acs_conn_str)
         self.identity_client = CommunicationIdentityClient.from_connection_string(acs_conn_str)
@@ -125,20 +125,72 @@ class RoomUserObserver(Subject):
         for observer in self._observers:
             observer.update(self, event)
 
-    def register_invoker(self, session_id: str, invoker: Invoker):
-        """Register a WebSocket for a session.""" 
-        self._invokers[session_id] = invoker
+    def register_invoker(self, call_connection_id: str, invoker: Invoker):
+        """Register an Invoker for a call connection. Only one invoker per connection is allowed."""
+        if call_connection_id in self._invokers:
+            logger.warning(f"Invoker already exists for call_connection_id={call_connection_id}, skipping registration.")
+            return
+        logger.info(f"Registering invoker for call_connection_id={call_connection_id}")
+        self._invokers[call_connection_id] = invoker
 
-    def unregister_invoker(self, session_id: str):
-        """Remove a WebSocket mapping for a session."""
-        self._invokers.pop(session_id, None)
+    def enable_invoker(self, call_connection_id: str, websocket: WebSocket):
+        """Enable an Invoker by attaching a WebSocket for a call connection. Create and register if not exists."""
+        logger.info(f"Enabling invoker for call_connection_id={call_connection_id}")
+        invoker = self._invokers.get(call_connection_id)
+        if not invoker:
+            # Create and register the invoker only when websocket is active
+            translate_command = TranslateCommand()
+            # You may want to set entry/exit language dynamically if needed
+            translate_command.configure(entry_language="en", exit_language="zh")
+            invoker = Invoker(command=translate_command)
+            self.register_invoker(call_connection_id, invoker)
+            logger.info(f"Invoker created and registered for call_connection_id={call_connection_id}")
+        # Only attach if not already attached or if websocket is different
+        if getattr(invoker.command, 'ws', None) is not None and invoker.command.ws is websocket:
+            logger.info(f"WebSocket already attached to invoker for call_connection_id={call_connection_id}")
+            logger.info(f"[INVOKER STATUS] Invoker already attached for call_connection_id={call_connection_id}")
+            return invoker
+        invoker.command.ws = websocket
+        logger.info(f"WebSocket attached to invoker for call_connection_id={call_connection_id}")
+        logger.info(f"[INVOKER STATUS] Invoker attached for call_connection_id={call_connection_id}")
+        # Ensure websocket is open before returning invoker
+        # (This is the new logic: try to re-open if closed)
+        # This is safe to call even if already open
+        import asyncio
+        try:
+            # If not in an event loop, schedule open_if_closed
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                asyncio.create_task(invoker.open_if_closed())
+            else:
+                loop.run_until_complete(invoker.open_if_closed())
+        except Exception as e:
+            logger.warning(f"Could not ensure websocket is open for invoker: {e}")
+        return invoker
 
-    def map_connection_to_session(self, call_connection_id: str, session_id: str):
-        """Associate a call connection ID with a session ID."""
-        self._connection_session[call_connection_id] = session_id
+    async def cleanup_invoker(self, call_connection_id: str):
+        """Properly close and remove the invoker for a call connection on disconnect."""
+        invoker = self._invokers.get(call_connection_id)
+        if invoker:
+            try:
+                await invoker.__aexit__(None, None, None)
+                logger.info(f"Closed invoker for call_connection_id={call_connection_id}")
+                logger.info(f"[INVOKER STATUS] Invoker closed for call_connection_id={call_connection_id}")
+            except Exception as e:
+                logger.error(f"Error closing invoker for call_connection_id={call_connection_id}: {e}")
+        self.unregister_invoker(call_connection_id)
+
+    def unregister_invoker(self, call_connection_id: str):
+        """Remove an Invoker mapping for a call connection."""
+        if call_connection_id in self._invokers:
+            logger.info(f"Unregistering invoker for call_connection_id={call_connection_id}")
+            logger.info(f"[INVOKER STATUS] Invoker unregistered for call_connection_id={call_connection_id}")
+        else:
+            logger.warning(f"Tried to unregister invoker for non-existent call_connection_id={call_connection_id}")
+        self._invokers.pop(call_connection_id, None)
 
     def get_invoker_for_connection(self, call_connection_id: str):
-        """Retrieve the WebSocket for a given call connection ID."""
+        """Retrieve the Invoker for a given call connection ID."""
         return self._invokers.get(call_connection_id)
 
     async def handle_incoming_call(self, event_dict):
@@ -259,24 +311,26 @@ class RoomUserObserver(Subject):
                 bot_info = {'display_name': call_info.bot_display_name, 'language': call_info.bot_language}  #type: ignore
                 logger.info(f"bot_info for call_connection_id={call_connection_id}: {bot_info}")
 
+                # Do NOT register invoker here anymore
                 self.join_bot_to_acs_call(call_connection_id, bot_info)
             except Exception as e:
                 logger.error(f"Failed to get call properties for {call_connection_id}: {e}")
 
     async def _handle_media_streaming_started(self, event_data, call_connection_id):
+        # Only log, do not register invoker here anymore
         logger.info(f"Media streaming started for call_connection_id={call_connection_id}")
+        logger.info(f"Event data:\n {event_data} ")
 
     async def _handle_media_streaming_stopped(self, event_data, call_connection_id):
         logger.info(f"Media streaming stopped for call_connection_id={call_connection_id}")
+        logger.info(f"Event data:\n {event_data} ")
+        # Do NOT unregister invoker here anymore
         if not call_connection_id in self._call_connections:
             logger.warning(f"Call connection {call_connection_id} not found in active connections.")
-        call_connection = self.acs_client.get_call_connection(call_connection_id)
-        call_connection.hang_up(is_for_everyone=True)
 
     async def _handle_media_streaming_failed(self, event_data, call_connection_id):
         logger.error(f"Media streaming failed for call_connection_id={call_connection_id}")
-        call_connection = self.acs_client.get_call_connection(call_connection_id)
-        call_connection.hang_up(is_for_everyone=True)
+        logger.info(f"Event data:\n {event_data} ")
 
     async def _handle_participant_updated(self, event_data, call_connection_id):
         call_data = self._call_connections.get(call_connection_id)

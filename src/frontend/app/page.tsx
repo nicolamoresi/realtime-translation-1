@@ -35,7 +35,7 @@ export default function Home() {
 
   return (
     <main className="h-screen flex flex-col items-center justify-center bg-gradient-to-b from-blue-50 to-white">
-      <h1 className="text-4xl font-bold mb-8 text-blue-700">Azure Real-time Translation</h1>
+      <h1 className="text-4xl font-bold mb-8 text-blue-700">Azure Real-time Conversation Room</h1>
       
       <div className="w-full max-w-md p-8 bg-white rounded-lg shadow-lg border border-blue-100">
         <form onSubmit={handleJoinRoom} className="space-y-6">

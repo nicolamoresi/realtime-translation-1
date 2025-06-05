@@ -1,6 +1,3 @@
-// aoai.bicep
-// Azure OpenAI / AI Services module
-
 targetScope = 'resourceGroup'
 
 @description('Name of the Azure AI Services account')
@@ -64,24 +61,6 @@ resource openAIExisting 'Microsoft.CognitiveServices/accounts@2024-10-01' existi
   name: aiServiceAccountName
 }
 
-// Model deployment for newly created account
-resource modelDeploymentForAccount 'Microsoft.CognitiveServices/accounts/deployments@2024-10-01' = if (deployAccount) {
-  parent: openAIService
-  name: modelDeploymentName
-  properties: {
-    model: {
-      format: 'OpenAI'
-      name: modelName
-      version: modelVersion
-    }
-  }
-  sku: {
-    name: 'GlobalStandard'
-    capacity: capacity
-  }
-  tags: tags
-}
-
 // Model deployment for existing account
 resource modelDeploymentForExisting 'Microsoft.CognitiveServices/accounts/deployments@2024-10-01' = if (!deployAccount) {
   parent: openAIExisting
@@ -103,4 +82,3 @@ resource modelDeploymentForExisting 'Microsoft.CognitiveServices/accounts/deploy
 // Outputs
 output openAIAccountId string = deployAccount ? openAIService.id : openAIExisting.id
 output openAIEndpoint  string = deployAccount ? openAIService.properties.endpoint : openAIExisting.properties.endpoint
-output deploymentId     string = deployAccount ? modelDeploymentForAccount.id : modelDeploymentForExisting.id

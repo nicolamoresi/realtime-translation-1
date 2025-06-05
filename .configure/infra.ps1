@@ -31,7 +31,6 @@ foreach ($acct in $accounts) {
   $name = $acct.Name
   $param = $acct.Param
 
-  # Obter todos os soft-deletados na região e filtrar pelo nome
   $deleted = az cognitiveservices account list-deleted `
     --output json | ConvertFrom-Json
 
@@ -47,7 +46,6 @@ foreach ($acct in $accounts) {
 
 Write-Host "🔧 Parâmetros de restauração: $($restoreParams | Out-String)"
 
-# Garante que endpoint esteja no subnet
 function Set-CognitiveServicesEndpoint {
     Write-Host "🔧 Verificando endpoint Microsoft.CognitiveServices..."
     $endpoints = az network vnet subnet show `
@@ -68,27 +66,38 @@ function Set-CognitiveServicesEndpoint {
 
 # Inicia deploy principal
 function Deploy-MainTemplate {
-    $paramArgs = @("rgName=$rgName", "location=$location")
+    # core params
+    $paramArgs = @(
+      "rgName=$rgName"
+      "location=$location"
+    )
+    # add any restore flags
     foreach ($kvp in $restoreParams.GetEnumerator()) {
       $paramArgs += "$($kvp.Key)=$($kvp.Value)"
     }
-  
-    # Montar a string de parâmetros
-    $joinedParams = $paramArgs -join ' '
-  
-    # Montar e imprimir o comando antes de executar
-    $command = "az deployment sub create --location $location --template-file .\infra\main.bicep --parameters $joinedParams --verbose --debug"
-    Write-Host "🔧 Executando comando:"
-    Write-Host $command
-  
-    # Capturar a saída do comando
-    $output = & az deployment sub create `
-      --location $location `
-      --template-file ".\infra\main.bicep" `
-      --parameters $paramArgs
-  
+
+    # build the full CLI argument list
+    $cliArgs = @(
+      "deployment" 
+      "sub" 
+      "create"
+      "--location" 
+      $location
+      "--template-file" 
+      "$PSScriptRoot\..\infra\main.bicep"
+      "--parameters"
+    ) + $paramArgs + @(
+      "--verbose"
+      "--debug"
+    )
+
+    Write-Host "🔧 Executando deploy: az $($cliArgs -join ' ')"
+
+    # invoke Azure CLI with splatted array
+    $output = az @cliArgs
+
     return $output
-  }
+}
 
 try {
     Write-Host "🚀 Iniciando deploy da infraestrutura principal..."

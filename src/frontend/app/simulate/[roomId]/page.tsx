@@ -1,7 +1,7 @@
 'use client'
 
 /*
-  Mic‑only real‑time translation demo
+  Mic-only real-time translation demo
   ───────────────────────────────────
   • POST /chat/start                – create session
   • POST /chat/message {audio:b64}  – send audio, receive {reply, audio}
@@ -23,7 +23,7 @@ interface ChatLine { role: 'assistant' | 'user'; content: string }
 
 export default function Simulator() {
   /* ─ state ─ */
-  const { roomId }        = useParams<{ roomId: string }>()
+  const { roomId } = useParams<{ roomId: string }>()
   const [token, setTok]   = useState<string | null>(null)
   const [sid,   setSid]   = useState<string | null>(null)
   const [chat,  setChat]  = useState<ChatLine[]>([])
@@ -46,7 +46,9 @@ export default function Simulator() {
         if (!t) throw new Error('no token')
         if (anon) localStorage.setItem('token', t)
         setTok(t)
-      } catch { setErr('Authentication failed') }
+      } catch {
+        setErr('Authentication failed')
+      }
     })()
   }, [roomId])
 
@@ -59,12 +61,18 @@ export default function Simulator() {
         setSid(session_id)
         setChat([{ role: 'assistant', content: message }])
         setStats('Ready')
-      } catch { setErr('Failed to create session') }
+      } catch {
+        setErr('Failed to create session')
+      }
     })()
   }, [token])
 
   /* cleanup */
-  useEffect(() => () => { if (sid) stopChatSession(sid).catch(() => {}) }, [sid])
+  useEffect(() => {
+    return () => {
+      if (sid) stopChatSession(sid).catch(() => {})
+    }
+  }, [sid])
 
   /* mic helpers */
   async function startRec() {
@@ -74,38 +82,56 @@ export default function Simulator() {
       const mr = new MediaRecorder(stream, { mimeType: 'audio/webm' })
       media.current = mr
 
-      mr.ondataavailable = e => { if (e.data.size) chunks.current.push(e.data) }
+      mr.ondataavailable = (e: BlobEvent) => { if (e.data.size) chunks.current.push(e.data) }
 
       mr.onstop = async () => {
         const blob = new Blob(chunks.current, { type: 'audio/webm' })
         chunks.current = []
         const b64 = await blobToB64(blob)
         try {
-          const rsp = await sendChatMessage(sid, undefined, b64)
+          const rsp = await sendChatMessage(sid!, undefined, b64)
+
           // assistant reply
-          if (rsp.reply)
+          if (rsp.reply) {
             setChat(c => [...c, { role: 'assistant', content: rsp.reply }])
+          }
+
           // assistant audio
           if (rsp.audio_base64 && audioR.current) {
             try {
-              // ➋ wrap PCM‑16 bytes into a playable WAV container
-              const wavBytes = encodeWav(rsp.audio_base64, 24000 /*Hz*/)
-              const url = URL.createObjectURL(new Blob([wavBytes], { type: 'audio/wav' }))
+              // ➊ encoda PCM16 -> WAV bytes
+              const wavBytes = encodeWav(rsp.audio_base64, 24000 /* Hz */)
+
+              // ➋ copia in un buffer "sicuro" (non SharedArrayBuffer)
+              const copied = new Uint8Array(wavBytes)            // nuova view con nuovo ArrayBuffer
+              const ab: ArrayBuffer = copied.buffer.slice(0)     // ArrayBuffer puro
+
+              // ➌ crea Blob e URL
+              const url = URL.createObjectURL(new Blob([ab], { type: 'audio/wav' }))
               audioR.current.src = url
               await audioR.current.play().catch(() => {})
-            } catch { /* ignore bad audio */ }
+            } catch {
+              // ignore bad audio
+            }
           }
-        } catch {/* ignore per‑chunk errors */}
+        } catch {
+          // ignore per-chunk errors
+        }
+
         if (rec) mr.start()
       }
 
       mr.start()
       setRec(true)
-    } catch { setErr('Mic permission denied') }
+      setStats('Recording …')
+    } catch {
+      setErr('Mic permission denied')
+    }
   }
 
   const stopRec = () => {
     setRec(false)
+    setStats('Ready')
     media.current?.stop()
     media.current?.stream.getTracks().forEach(t => t.stop())
     media.current = null

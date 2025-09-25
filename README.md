@@ -1,4 +1,4 @@
-# Real-Time Multilingual Chat & Voice Translation
+# Real-Time Multilingual Chat & Voice Translations
 
 A cloud-native platform that lets people who speak different languages converse naturally, in real time, by capturing speech, translating on the fly, and rebroadcasting both audio and text back into the same virtual “room.”
 
